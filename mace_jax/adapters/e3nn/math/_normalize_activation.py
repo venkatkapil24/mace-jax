@@ -130,7 +130,6 @@ def normalize2mom(
     identifier = _activation_key(f)
     override = _CONST_OVERRIDES.get(identifier, None) if identifier else None
 
-    @jax.jit
     def compute_const(prng_key):
         return moment(f, 2, prng_key, dtype=dtype) ** -0.5
 

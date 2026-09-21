@@ -1,9 +1,11 @@
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 from flax import nnx
 
+from mace_jax.adapters.nnx.torch import init_from_torch
 from mace_jax.nnx_utils import state_to_pure_dict
 
 try:  # pragma: no cover - optional torch dependency for parity tests
@@ -29,6 +31,34 @@ def _split_module(module):
 
 
 class TestBesselBasisParity:
+    def test_import_preserves_float32_checkpoint_constants_and_gradient(self):
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float32)
+            torch_module = BesselBasisTorch(r_max=6.0, num_basis=8)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        torch_module = torch_module.double()
+        model, _ = init_from_torch(BesselBasisJAX(r_max=6.0, num_basis=8), torch_module)
+
+        np.testing.assert_array_equal(
+            np.asarray(model._bessel_weights.value),
+            torch_module.bessel_weights.detach().numpy(),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(model._prefactor.value),
+            torch_module.prefactor.detach().numpy(),
+        )
+
+        x_t = torch.tensor([[0.96], [1.57]], dtype=torch.float64, requires_grad=True)
+        torch_output = torch_module(x_t)
+        torch_gradient = torch.autograd.grad(torch_output.sum(), x_t)[0]
+        x_j = jnp.asarray(x_t.detach().numpy())
+        jax_output = model(x_j)
+        jax_gradient = jax.grad(lambda x: jnp.sum(model(x)))(x_j)
+        np.testing.assert_allclose(jax_output, torch_output.detach(), atol=1e-12)
+        np.testing.assert_allclose(jax_gradient, torch_gradient, atol=1e-12)
+
     @pytest.mark.parametrize('trainable', [False, True])
     @pytest.mark.parametrize('num_basis', [4, 8])
     def test_forward(self, trainable, num_basis):

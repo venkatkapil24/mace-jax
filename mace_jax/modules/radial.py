@@ -13,7 +13,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import nnx
 
-from mace_jax.adapters.nnx.torch import nxx_auto_import_from_torch
+from mace_jax.adapters.nnx.torch import (
+    _resolve_scope,
+    nxx_auto_import_from_torch,
+    nxx_register_import_mapper,
+)
+from mace_jax.nnx_config import ConfigVar
 from mace_jax.tools.dtype import default_dtype
 from mace_jax.tools.scatter import scatter_sum
 
@@ -44,7 +49,10 @@ class BesselBasis(nnx.Module):
             / float(self.r_max)
             * jnp.linspace(1.0, self.num_basis, self.num_basis, dtype=default_dtype())
         )
-        self._bessel_weights = init_bessel
+        self._bessel_weights = ConfigVar(init_bessel)
+        self._prefactor = ConfigVar(
+            jnp.sqrt(jnp.asarray(2.0 / self.r_max, dtype=default_dtype()))
+        )
         if self.trainable:
             if rngs is None:
                 raise ValueError('rngs is required for trainable BesselBasis')
@@ -58,9 +66,19 @@ class BesselBasis(nnx.Module):
         if self.trainable and self.bessel_weights is not None:
             bessel_weights = jnp.asarray(self.bessel_weights, dtype=dtype)
         else:
-            bessel_weights = jnp.asarray(self._bessel_weights, dtype=dtype)
+            stored_weights = getattr(
+                self._bessel_weights, 'value', self._bessel_weights
+            )
+            bessel_weights = jnp.asarray(stored_weights, dtype=dtype)
 
-        prefactor = jnp.sqrt(2.0 / jnp.asarray(self.r_max, dtype=dtype))
+        stored_prefactor = getattr(self, '_prefactor', None)
+        prefactor = (
+            jnp.asarray(
+                getattr(stored_prefactor, 'value', stored_prefactor), dtype=dtype
+            )
+            if stored_prefactor is not None
+            else jnp.sqrt(2.0 / jnp.asarray(self.r_max, dtype=dtype))
+        )
 
         eps = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
         near_zero = jnp.abs(x) < eps
@@ -78,6 +96,23 @@ class BesselBasis(nnx.Module):
         return (
             f'{self.__class__.__name__}(r_max={self.r_max}, '
             f'num_basis={self.num_basis}, trainable={self.trainable})'
+        )
+
+
+@nxx_register_import_mapper('mace.modules.radial.BesselBasis')
+def _import_bessel_basis(module, variables, scope) -> None:
+    # Torch calls this child bessel_fn; the JAX radial block calls it basis_fn.
+    target_scope = list(scope)
+    if target_scope and target_scope[-1] == 'bessel_fn':
+        target_scope[-1] = 'basis_fn'
+    target = _resolve_scope(variables, target_scope)
+    weights = module.bessel_weights.detach().cpu().numpy()
+    for key in ('_bessel_weights', 'bessel_weights'):
+        if key in target and target[key] is not None:
+            target[key] = jnp.asarray(weights, dtype=target[key].dtype)
+    if '_prefactor' in target:
+        target['_prefactor'] = jnp.asarray(
+            module.prefactor.detach().cpu().numpy(), dtype=target['_prefactor'].dtype
         )
 
 

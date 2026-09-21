@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import cuequivariance as cue
 import cuequivariance_jax as cuex
 import jax
 import jax.numpy as jnp
@@ -9,7 +10,6 @@ import numpy as np
 from e3nn_jax import Irreps, IrrepsArray  # type: ignore
 from flax import nnx
 
-import cuequivariance as cue
 from mace_jax.adapters.nnx.torch import nxx_auto_import_from_torch
 from mace_jax.nnx_config import ConfigVar
 from mace_jax.tools.dtype import default_dtype
@@ -41,6 +41,7 @@ class Linear(nnx.Module):
         irreps_out: Irreps,
         shared_weights: bool | None = None,
         internal_weights: bool | None = None,
+        biases: bool = False,
         layout: object = 'mul_ir',
         group: object = cue.O3,
         *,
@@ -50,6 +51,7 @@ class Linear(nnx.Module):
         self.irreps_out = irreps_out
         self.shared_weights = shared_weights
         self.internal_weights = internal_weights
+        self.biases = biases
         self.layout = layout
         self.group = group
         """Resolve configuration flags and construct the cue descriptor."""
@@ -97,6 +99,13 @@ class Linear(nnx.Module):
             )
         else:
             self.weight = None
+        bias_indices = []
+        for (_mul, ir), block in zip(self.irreps_out_o3, self.irreps_out_o3.slices()):
+            if ir.l == 0 and ir.p == 1:
+                bias_indices.extend(range(block.start, block.stop))
+        self._bias_indices = tuple(bias_indices)
+        if biases:
+            self.bias = nnx.Param(jnp.zeros((len(bias_indices),), dtype=default_dtype()))
 
     @staticmethod
     def _resolve_layout(layout_obj: object) -> tuple[cue.IrrepsLayout, str]:
@@ -243,6 +252,10 @@ class Linear(nnx.Module):
                 f'{self._descriptor_output_layout!r} to {self._api_layout!r}.'
             )
 
+        if self.biases:
+            out_mul_ir = out_mul_ir.at[..., jnp.asarray(self._bias_indices)].add(
+                self.bias.astype(dtype)
+            )
         if had_irreps:
             return IrrepsArray(irreps_out, out_mul_ir)
         return out_mul_ir

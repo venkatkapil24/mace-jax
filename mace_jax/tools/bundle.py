@@ -28,6 +28,20 @@ class ModelBundle:
     graphdef: object
 
 
+def _restore_serialized_state(template: dict, payload: bytes) -> dict:
+    """Load state, supplying radial constants absent from older bundles."""
+    restored = serialization.msgpack_restore(payload)
+    template_basis = template.get('radial_embedding', {}).get('basis_fn', {})
+    if template_basis:
+        restored_basis = restored.setdefault('radial_embedding', {}).setdefault(
+            'basis_fn', {}
+        )
+        for key in ('_bessel_weights', '_prefactor'):
+            if key in template_basis and key not in restored_basis:
+                restored_basis[key] = template_basis[key]
+    return serialization.from_state_dict(template, restored)
+
+
 def resolve_model_paths(model_arg: str) -> tuple[Path, Path]:
     path = Path(model_arg).expanduser().resolve()
     if path.is_dir():
@@ -76,13 +90,16 @@ def _load_checkpoint_bundle(path: Path, dtype: str) -> ModelBundle:
     )
     if state_payload is None:
         raise ValueError(f'Checkpoint {path} is missing state/params payload.')
-    model_config, _, _ = model_builder._normalize_atomic_config(model_config)
     _maybe_set_dtype(dtype)
+    model_config, _, _ = model_builder._normalize_atomic_config(
+        model_config,
+        dtype=np.float64 if dtype.lower() == 'float64' else np.float32,
+    )
     module = model_builder._build_jax_model(model_config, rngs=nnx.Rngs(0))
     graphdef, state = nnx.split(module)
     state_template = state_to_serializable_dict(state)
     if isinstance(state_payload, (bytes, bytearray)):
-        state_pure = serialization.from_bytes(state_template, state_payload)
+        state_pure = _restore_serialized_state(state_template, state_payload)
     else:
         state_pure = state_payload
     _replace_state_with_specials(state, state_pure)
@@ -110,11 +127,14 @@ def load_model_bundle(
     if wrapper not in (None, '', 'mace'):
         raise ValueError('mace-jax only supports the built-in MACE wrapper.')
 
-    config, _, _ = model_builder._normalize_atomic_config(config)
+    config, _, _ = model_builder._normalize_atomic_config(
+        config,
+        dtype=np.float64 if dtype.lower() == 'float64' else np.float32,
+    )
     module = model_builder._build_jax_model(config, rngs=nnx.Rngs(0))
     graphdef, state = nnx.split(module)
     state_template = state_to_serializable_dict(state)
-    state_pure = serialization.from_bytes(state_template, params_path.read_bytes())
+    state_pure = _restore_serialized_state(state_template, params_path.read_bytes())
     _replace_state_with_specials(state, state_pure)
     state_pure = state_to_pure_dict(state)
     _validate_config_matches_params(config, state_pure, context=str(params_path))
@@ -182,4 +202,4 @@ def _replace_state_with_specials(state: nnx.State, state_pure: dict) -> None:
     if normalize2mom is not None:
         cfg = state.get('_normalize2mom_consts_var', None)
         if isinstance(cfg, ConfigVar):
-            cfg.set_value(normalize2mom)
+            cfg.value = normalize2mom

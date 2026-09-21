@@ -8,7 +8,7 @@ import numpy as np
 
 try:  # pragma: no cover - optional runtime dependency
     from lammps.mliap import jax as _lammps_mliap_jax
-except ImportError:  # pragma: no cover - optional runtime dependency
+except (ImportError, OSError):  # pragma: no cover - optional runtime dependency
     _HAS_LAMMPS_JAX = False
     _ffi_forward_exchange = None
 else:

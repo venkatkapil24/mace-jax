@@ -22,17 +22,17 @@ from __future__ import annotations
 
 from functools import cache
 
+import cuequivariance as cue
 import cuequivariance_jax as cuex
 import jax
 import jax.numpy as jnp
 import numpy as np
-from e3nn_jax import Irreps
-from flax import nnx
-
-import cuequivariance as cue
 from cuequivariance.group_theory.experimental.mace.symmetric_contractions import (
     symmetric_contraction as cue_mace_symmetric_contraction,
 )
+from e3nn_jax import Irreps
+from flax import nnx
+
 from mace_jax.adapters.nnx.torch import (
     _resolve_scope,
     nxx_auto_import_from_torch,
@@ -673,7 +673,10 @@ def _compute_full_cg_transform(
     """
     base_in = Irreps(str(irreps_in)).set_mul(1)
     base_out = Irreps(str(irreps_out)).set_mul(1)
-    return _cached_full_cg_transform(str(base_in), str(base_out), int(correlation))
+    dtype_name = np.dtype(default_dtype()).name
+    return _cached_full_cg_transform(
+        str(base_in), str(base_out), int(correlation), dtype_name
+    )
 
 
 @cache
@@ -681,6 +684,7 @@ def _cached_full_cg_transform(
     irreps_in_str: str,
     irreps_out_str: str,
     correlation: int,
+    dtype_name: str,
 ) -> np.ndarray:
     """Compute the native → canonical transform for full CG weights.
 
@@ -705,21 +709,28 @@ def _cached_full_cg_transform(
             'Full CG transforms rely on the PyTorch wrapper ops, which are only '
             'available when mace is installed with its torch components.'
         ) from exc
+    import torch  # noqa: PLC0415
 
     irreps_in_o3 = o3.Irreps(irreps_in_str)
     irreps_out_o3 = o3.Irreps(irreps_out_str)
+    np_dtype = np.dtype(dtype_name)
+    torch_dtype = torch.float64 if np_dtype == np.dtype('float64') else torch.float32
 
-    torch_module = (
-        TorchSymmetricContraction(
+    # Torch constructs its CG buffers using the process-wide default dtype.
+    # Build the design matrices at the JAX compute precision; a float32 fit
+    # leaves an observable error when importing a full-CG float64 checkpoint.
+    previous_torch_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch_dtype)
+        torch_module = TorchSymmetricContraction(
             irreps_in=irreps_in_o3,
             irreps_out=irreps_out_o3,
             correlation=correlation,
             num_elements=1,
             use_reduced_cg=False,
-        )
-        .float()
-        .eval()
-    )
+        ).eval()
+    finally:
+        torch.set_default_dtype(previous_torch_dtype)
 
     jax_module = SymmetricContraction(
         irreps_in=Irreps(irreps_in_str),
@@ -747,7 +758,7 @@ def _cached_full_cg_transform(
 
     batch = max(canonical_dim, native_dim)
     rng = np.random.default_rng(0)
-    inputs_np = rng.standard_normal((batch, mul, feature_dim)).astype(np.float32)
+    inputs_np = rng.standard_normal((batch, mul, feature_dim)).astype(np_dtype)
 
     inputs_jax = jnp.asarray(inputs_np)
     indices_jax = jnp.zeros((batch,), dtype=jnp.int32)
@@ -766,7 +777,7 @@ def _cached_full_cg_transform(
     )
 
     transform = np.linalg.lstsq(canonical_matrix, native_matrix, rcond=1e-12)[0]
-    return transform.astype(np.float64)
+    return transform.astype(np_dtype)
 
 
 def _with_zero_weights(params: dict) -> dict:
@@ -799,8 +810,9 @@ def _canonical_design_matrix(
     canonical_dim = weight_shape[1]
 
     outputs: list[np.ndarray] = []
+    dtype = np.asarray(inputs).dtype
     for idx in range(canonical_dim):
-        weight = np.zeros(weight_shape, dtype=np.float32)
+        weight = np.zeros(weight_shape, dtype=dtype)
         weight[0, idx, 0] = 1.0
 
         params_idx = dict(params_zero)
@@ -834,13 +846,14 @@ def _native_design_matrix(
     """
     import torch  # noqa: PLC0415
 
-    torch_inputs = torch.tensor(inputs_np, dtype=torch.float32)
+    torch_dtype = torch.from_numpy(inputs_np).dtype
+    torch_inputs = torch.tensor(inputs_np, dtype=torch_dtype)
     num_elements = torch_module.contractions[0].weights_max.shape[0]
-    torch_attrs = torch.ones((inputs_np.shape[0], num_elements), dtype=torch.float32)
+    torch_attrs = torch.ones((inputs_np.shape[0], num_elements), dtype=torch_dtype)
 
     outputs: list[np.ndarray] = []
     for idx in range(basis_dim):
-        basis = np.zeros(basis_dim, dtype=np.float32)
+        basis = np.zeros(basis_dim, dtype=inputs_np.dtype)
         basis[idx] = 1.0
         _assign_native_basis(torch_module, basis_vector=basis, correlation=correlation)
         with torch.no_grad():

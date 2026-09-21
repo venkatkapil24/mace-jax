@@ -10,6 +10,7 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
+import jax
 import numpy as np
 
 from mace_jax.modules.wrapper_ops import EquivarianceConfig
@@ -134,6 +135,8 @@ def convert_model(
     cueq_config: object | None = None,
 ):
     _maybe_update_hidden_irreps_from_torch(torch_model, config)
+    if hasattr(torch_model, 'kspace_cutoff'):
+        config['kspace_cutoff'] = float(torch_model.kspace_cutoff)
 
     jax_model = _build_jax_model(
         config,
@@ -180,6 +183,12 @@ def main():
             "(or '<source>-<model>-jax.npz' for foundation downloads)."
         ),
     )
+    parser.add_argument(
+        '--dtype',
+        choices=('auto', 'float32', 'float64'),
+        default='auto',
+        help='Conversion precision; auto follows the checkpoint parameters.',
+    )
     args = parser.parse_args()
 
     if args.torch_model:
@@ -197,6 +206,17 @@ def main():
             args.foundation, args.model_name
         )
     torch_model.eval()
+    parameter = next(
+        (p for p in torch_model.parameters() if p.is_floating_point()), None
+    )
+    checkpoint_dtype = parameter.dtype if parameter is not None else torch.float32
+    target_dtype = (
+        checkpoint_dtype if args.dtype == 'auto' else getattr(torch, args.dtype)
+    )
+    if target_dtype not in (torch.float32, torch.float64):
+        raise ValueError(f'Unsupported checkpoint floating point dtype {target_dtype}')
+    jax.config.update('jax_enable_x64', target_dtype == torch.float64)
+    torch_model = torch_model.to(dtype=target_dtype)
 
     if args.output is None:
         if args.torch_model:

@@ -513,6 +513,7 @@ class Linear:
         irreps_out: Irreps,
         shared_weights: bool = True,
         internal_weights: bool = True,
+        biases: bool = False,
         equivariance_config: EquivarianceConfig | dict[str, object] | None = None,
         cueq_config: object | None = None,
         rngs: nnx.Rngs | None = None,
@@ -533,6 +534,7 @@ class Linear:
         linear_kwargs = dict(
             shared_weights=shared_weights,
             internal_weights=internal_weights,
+            biases=biases,
             layout=layout,
         )
         if group is not None:
@@ -578,7 +580,7 @@ class TensorProduct:
         )
         if use_openeq:
             # Keep this import lazy: OpenEquivariance is an optional CUDA backend.
-            from mace_jax.adapters.openequivariance import (
+            from mace_jax.adapters.openequivariance import (  # noqa: PLC0415
                 TensorProduct as OpenEqTensorProduct,
             )
 
@@ -690,8 +692,6 @@ def SymmetricContractionWrapper(
     cueq_config = (
         equivariance_config.cueq_config if equivariance_config is not None else None
     )
-    use_cue = cueq_config is not None and getattr(cueq_config, 'enabled', False)
-
     group_value = getattr(cueq_config, 'group', None) if cueq_config else None
     if cueq_config is not None:
         _validate_cue_group(group_value, context='SymmetricContraction')

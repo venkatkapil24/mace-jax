@@ -37,6 +37,7 @@ from .loss import (
     uber_loss,
 )
 from .models import MACE, ScaleShiftMACE
+from .polar_model import PolarMACE
 
 __all__ = [
     'AtomicEnergiesBlock',
@@ -65,6 +66,7 @@ __all__ = [
     'uber_loss',
     'MACE',
     'ScaleShiftMACE',
+    'PolarMACE',
 ]
 
 # Optional: dict-layout experimental model. Import lazily to avoid hard failures

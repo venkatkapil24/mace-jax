@@ -31,13 +31,14 @@ def _extract_norm_consts() -> dict[str, float]:
 
     try:
         const = float(torch_norm(torch.nn.functional.silu).cst)
+        sigmoid_const = float(torch_norm(torch.sigmoid).cst)
     except Exception as exc:
         raise RuntimeError(
             'Unable to compute normalize2mom constant for torch.nn.functional.silu '
             'during import; parity cannot be guaranteed.'
         ) from exc
 
-    return {'silu': const, 'swish': const}
+    return {'silu': const, 'swish': const, 'sigmoid': sigmoid_const}
 
 
 def import_from_torch(jax_model, torch_model, variables):
@@ -58,21 +59,21 @@ def import_from_torch(jax_model, torch_model, variables):
 
         def _extract_with_nan(value):
             if isinstance(value, ConfigVar):
-                config_val = value.get_value()
+                config_val = value.value
                 if isinstance(config_val, dict) and not isinstance(
                     config_val, ConfigDict
                 ):
                     return ConfigDict(config_val)
                 return config_val
             if isinstance(value, nnx.Param):
-                arr = value.get_value()
+                arr = value.value
                 if isinstance(arr, jnp.ndarray) and jnp.issubdtype(
                     arr.dtype, jnp.floating
                 ):
                     return jnp.full_like(arr, jnp.nan)
                 return arr
             if isinstance(value, nnx.Variable):
-                return value.get_value()
+                return value.value
             return value
 
         variables_pure = nnx.to_pure_dict(variables, extract_fn=_extract_with_nan)
@@ -132,7 +133,7 @@ def import_from_torch(jax_model, torch_model, variables):
         if norm_consts:
             cfg = variables.get('_normalize2mom_consts_var', None)
             if isinstance(cfg, ConfigVar):
-                current = cfg.get_value()
+                current = cfg.value
                 if isinstance(current, dict):
                     updated = dict(current)
                     for key, value in norm_consts.items():
@@ -142,7 +143,7 @@ def import_from_torch(jax_model, torch_model, variables):
                         updated[key] = jax.lax.stop_gradient(
                             jnp.asarray(value, dtype=dtype or default_dtype())
                         )
-                    cfg.set_value(updated)
+                    cfg.value = updated
         # Keep the module in sync so downstream nnx.split() sees imported weights.
         # Rebuild a new module from the updated state to handle immutable params.
         try:

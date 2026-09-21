@@ -376,7 +376,7 @@ class TestSymmetricContractionImport:
         np.testing.assert_allclose(jax_output_np, torch_output, rtol=1e-6, atol=1e-6)
 
     def test_forward_matches_native_high_correlation(self, torch_device):
-        """Expected to fail until native high-order import is harmonised."""
+        """Full-CG conversion preserves float64 accuracy for higher orders."""
         irreps_in = Irreps('2x0e + 2x1o + 2x2e')
         irreps_out = Irreps('2x0e + 2x1o')
         correlation = 2
@@ -443,4 +443,11 @@ class TestSymmetricContractionImport:
                 torch_module(torch_inputs, torch_attrs).cpu().numpy().reshape(batch, -1)
             )
 
-        np.testing.assert_allclose(jax_output_np, torch_output, rtol=1e-5, atol=1e-4)
+        if torch_device.type == 'cpu' and dtype == torch.float64:
+            np.testing.assert_allclose(
+                jax_output_np, torch_output, rtol=1e-9, atol=1e-9
+            )
+        else:
+            np.testing.assert_allclose(
+                jax_output_np, torch_output, rtol=1e-5, atol=1e-4
+            )

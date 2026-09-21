@@ -45,6 +45,10 @@ class Configuration:
     polarizability_weight: float | None = None
     cell: Cell | None = None
     pbc: Pbc | None = None
+    total_charge: float = 0.0
+    total_spin: float = 1.0
+    fermi_level: float = 0.0
+    external_field: np.ndarray | None = None
 
     weight: float = 1.0  # weight of config in loss
     config_type: str | None = DEFAULT_CONFIG_TYPE  # config_type of config
@@ -196,6 +200,12 @@ def config_from_atoms(
         pbc=pbc,
         cell=cell,
         head=head,
+        total_charge=float(np.asarray(atoms.info.get('charge', 0.0)).reshape(())),
+        total_spin=float(np.asarray(atoms.info.get('spin', 1.0)).reshape(())),
+        fermi_level=float(np.asarray(atoms.info.get('fermi_level', 0.0)).reshape(())),
+        external_field=np.asarray(
+            atoms.info.get('external_field', np.zeros(3)), dtype=float
+        ).reshape(3),
     )
 
 
@@ -470,6 +480,11 @@ class GraphGlobals(NamedTuple):
     virials_weight: np.ndarray | None = None
     dipole_weight: np.ndarray | None = None
     polarizability_weight: np.ndarray | None = None
+    pbc: np.ndarray | None = None
+    total_charge: np.ndarray | None = None
+    total_spin: np.ndarray | None = None
+    fermi_level: np.ndarray | None = None
+    external_field: np.ndarray | None = None
 
 
 def graph_from_configuration(
@@ -527,6 +542,19 @@ def graph_from_configuration(
                 virials=config.virials,
                 dipole=config.dipole,
                 polarizability=config.polarizability,
+                pbc=np.asarray(
+                    config.pbc if config.pbc is not None else (False, False, False),
+                    dtype=bool,
+                ),
+                total_charge=np.asarray(config.total_charge),
+                total_spin=np.asarray(config.total_spin),
+                fermi_level=np.asarray(config.fermi_level),
+                external_field=np.asarray(
+                    config.external_field
+                    if config.external_field is not None
+                    else np.zeros(3),
+                    dtype=float,
+                ),
                 energy_weight=(
                     None
                     if config.energy_weight is None

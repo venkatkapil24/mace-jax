@@ -14,12 +14,12 @@ def state_to_pure_dict(state: nnx.State) -> dict[str, Any]:
 
     def _extract(value):
         if isinstance(value, ConfigVar):
-            config_val = value.get_value()
+            config_val = value.value
             if isinstance(config_val, dict) and not isinstance(config_val, ConfigDict):
                 return ConfigDict(config_val)
             return config_val
         if isinstance(value, nnx.Variable):
-            return value.get_value()
+            return value.value
         return value
 
     return nnx.to_pure_dict(state, extract_fn=_extract)

@@ -126,8 +126,8 @@ def get_outputs(
     masks so callers can tell which entries are meaningful.
 
     Args:
-        energy_fn: Callable that accepts positions (and optional shifts) and
-            returns per-graph energies with shape `[n_graphs]`.
+        energy_fn: Callable that accepts positions, optional shifts, and an
+            optional deformed cell, returning per-graph energies `[n_graphs]`.
         data: Graph batch containing at least `positions`, `cell`, `unit_shifts`,
             `edge_index`, `batch`, and `ptr`.
         compute_force: Whether to return forces. May be a Python bool or a JAX
@@ -169,7 +169,9 @@ def get_outputs(
             unit_shifts,
             cell_reshaped[batch[edge_index[0]]],
         )
-        per_graph_energy = energy_fn(deformed_positions, shifts=shifts)
+        per_graph_energy = energy_fn(
+            deformed_positions, shifts=shifts, cell=cell_reshaped
+        )
         return jnp.sum(per_graph_energy), per_graph_energy
 
     def energy_sum_fn(pos):
@@ -439,13 +441,16 @@ def add_output_interface(cls=None):
                 )
                 return result
 
-            def energy_fn(positions, shifts=None):
+            def energy_fn(positions, shifts=None, cell=None):
                 # Replace the positions in `data` with `pos` before recomputing
                 new_data = dict(data)
                 new_data['positions'] = positions
 
                 if shifts is not None:
                     new_data['shifts'] = shifts
+                if cell is not None:
+                    new_data['cell'] = cell
+                    new_data['reference_cell'] = data['cell']
 
                 out = self._energy_fn(
                     new_data,

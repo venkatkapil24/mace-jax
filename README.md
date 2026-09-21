@@ -2,6 +2,172 @@
 
 This repository contains a **porting** of MACE in **jax** developed by [**Philipp Benner**](https://bamescience.github.io/), **Abhijeet Gangan**, **Mario Geiger** and **Ilyes Batatia**.
 
+## TorchAX verifier for MACE-OFF23 small
+
+`scripts/verify_mace_torchax.py` compares a trusted local MACE checkpoint on
+native eager Torch and eager TorchAX, using the same ASE structure and graph.
+The first target is [MACE-OFF23 small](https://github.com/ACEsuit/mace-off/tree/main/mace_off23),
+a standard `ScaleShiftMACE` model. The script also accepts a PolarMACE
+checkpoint. No `torch.compile` or `jax.jit` is used. The native
+Torch result is the reference; the report records module outputs, bitwise
+equality, and configurable numerical tolerances. `--compute-force` additionally
+compares native Torch forces with `jax.grad` of the TorchAX energy. Stress
+gradients are not yet included.
+
+The current local test environment is
+`/Users/venkatkapil24/scratch/codex/jax/.venv` with Torch 2.11.0, TorchAX
+0.0.13, JAX 0.8.0, graph_longrange 0.4.4, and MACE source commit
+`c5c65fe77aa6fdc0e2c587a95abc52734d9ddb8e` (reported as mace-torch
+0.3.17). TorchAX 0.0.13 did not import with Torch 2.14.0 in this environment.
+Download [the small checkpoint](https://raw.githubusercontent.com/ACEsuit/mace-off/main/mace_off23/MACE-OFF23_small.model)
+and supply its local path. The checkpoint used for the results below has SHA256
+`165cce4cfec5a34b9c64d4ebf95de15d71106bb584b7291c8470f0749977c46f`.
+
+```sh
+curl -L --fail \
+  https://raw.githubusercontent.com/ACEsuit/mace-off/main/mace_off23/MACE-OFF23_small.model \
+  -o /tmp/MACE-OFF23_small.model
+/Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  scripts/verify_mace_torchax.py \
+  --checkpoint /tmp/MACE-OFF23_small.model \
+  --compute-force \
+  --report /tmp/mace-off23-torchax-report.json
+```
+
+By default, the test structure is water. Use `--xyz` to change the structure.
+For PolarMACE, `--charge`, `--spin`, `--field`, and `--pbc-handling` set the
+electrostatic case. The JSON report
+includes a checkpoint hash, runtime versions, tensor shapes, individual
+comparison results, and the first TorchAX execution error. The process exits
+nonzero for a mismatch or runtime error. `--require-bitwise` also makes any
+byte difference a failure; numerical agreement alone is the default pass
+criterion because the two backends may use different floating point reductions.
+
+On the current versions, MACE-OFF23 small passes energy and force comparison
+for water and methanol: all 13 captured tensors agree within tolerance in each
+case. The final energies are byte identical; maximum force differences are
+`1.1e-14` and `1.3e-15`, respectively, in float64. Five tensors are byte
+identical in each case. These are small smoke cases, not a general parity
+claim.
+
+### MACE-POLAR-1-M comparison
+
+The same verifier accepts the [released MACE-POLAR-1-M checkpoint](https://github.com/ACEsuit/mace-foundations/releases/tag/mace_polar_1).
+The checkpoint used here has SHA256
+`fab8b8713c832f31a2a853aaa22fd638be8a369cbf5095e6b3e982a18d10e93a`.
+Two TorchAX 0.0.13 issues require explicit diagnostic workarounds:
+
+- Indexing a TorchAX `View` raises `AttributeError: 'View' object has no attribute '_elem'`.
+- e3nn `Extract` copies into narrowed views, but TorchAX does not update the parent tensor. The verifier replaces this extraction in serialized e3nn `Gate` modules with equivalent functional slices after the native Torch run.
+
+```sh
+curl -L --fail \
+  https://github.com/ACEsuit/mace-foundations/releases/download/mace_polar_1/MACE-POLAR-1-M.model \
+  -o /tmp/MACE-POLAR-1-M.model
+/Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  scripts/verify_mace_torchax.py \
+  --checkpoint /tmp/MACE-POLAR-1-M.model \
+  --compute-force \
+  --workaround-view-getitem \
+  --workaround-e3nn-extract \
+  --report /tmp/polar-force-torchax-report.json
+```
+
+With both workarounds, neutral water and water with charge `+1`, spin
+multiplicity `2`, and an external field of `[0.01, 0, 0]` pass the forward and
+force comparisons. The neutral water comparison covers 54 tensors, including
+charges, dipole, electrostatic energy, total energy, and forces. Maximum energy
+and force differences are `1.4e-12` and `1.3e-12` in float64. In the charged
+field case, the maximum force difference is `6.9e-12`. A periodic water box
+also passes energy and force comparison with `--pbc-handling pbc`; its energy
+is byte identical and its maximum force difference is `1.8e-15`.
+
+The workarounds are marked in the JSON report. These runs verify TorchAX
+execution of the Torch model. The native JAX port has its own comparison below.
+
+## Native eager MACE-POLAR-1-M
+
+`mace_jax.modules.polar_model.PolarMACE` implements the released POLAR-1-M
+backbone, spin charge response, local electron energy, and Gaussian multipole
+electrostatics in JAX. Its electrostatic modes cover open boundaries, bulk
+periodic cells, slabs, molecules in boxes, and mixed periodic batches. Graph
+inputs carry total charge, spin multiplicity, external field, and PBC flags.
+Energy, forces, and stress are evaluated with JAX autodiff. The port
+and its verifier run eagerly; neither calls `jax.jit` or `torch.compile`.
+
+Convert the released Torch checkpoint with the shared float64 environment:
+
+```sh
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+  /Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  -m mace_jax.cli.mace_jax_from_torch \
+  --torch-model /tmp/MACE-POLAR-1-M.model \
+  --dtype float64 \
+  --output /tmp/MACE-POLAR-1-M-jax.msgpack
+```
+
+The converter stores the checkpoint's reciprocal cutoff explicitly. Rebuilding
+it from the recorded cutoff factor changes the number of Fourier vectors in
+this release. It also preserves Torch's repeated spin irreps layout, Bessel
+coefficients and prefactor, and fits the full CG weight transform in float64.
+Bundles exported before these corrections still load; re-export the checkpoint
+to obtain the improved agreement.
+
+Compare native JAX directly against Torch on water:
+
+```sh
+PYTHONPATH=. TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+  /Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  scripts/verify_polar_backbone.py /tmp/MACE-POLAR-1-M.model \
+  --pbc-handling realspace --compute-force \
+  --atol 1e-5 --rtol 1e-5
+PYTHONPATH=. TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
+  /Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  scripts/verify_polar_backbone.py /tmp/MACE-POLAR-1-M.model \
+  --pbc-handling pbc --compute-force --compute-stress \
+  --atol 1e-5 --rtol 1e-5
+```
+
+On these water cases with a newly converted float64 bundle, the maximum energy
+difference is below `2.7e-9` eV and the maximum force component difference is
+below `1.5e-8` eV/Å. The periodic stress differs by at most `2.0e-11` eV/Å³.
+These are smoke tests; broader structures and training behavior still need
+validation.
+
+Slab water also passes at `1e-5` relative and absolute tolerance. Charged water
+(`charge=+1`, spin multiplicity `2`) under an external field of `[0.01, 0, 0]`
+passes energy and force comparison; maximum differences are `1.9e-8` eV and
+`2.4e-8` eV/Å. The reference Torch forward reads a Fermi level input but uses
+zero scalar potential, and the JAX port follows that behavior. The Fourier
+evaluator also has a Torch parity test for a mixed bulk and slab batch.
+
+To verify the serialized artifact instead of an in-memory import, add
+`--jax-bundle /tmp/MACE-POLAR-1-M-jax.msgpack` to the comparison command.
+
+### Small static evaluation panel
+
+For a laptop-sized check across boundary conditions, the verifier also accepts
+`--s22 NAME` (an ASE S22 dimer) or `--structure FILE` (an ASE-readable geometry).
+The [MACE-POLAR-1 paper](https://arxiv.org/html/2602.19411) evaluates S22
+noncovalent interactions and X23-DMC molecular-crystal lattice energies.
+[ASE includes S22](https://ase.gitlab.io/ase/ase/collections.html); useful small
+cases are `Water_dimer` (6 atoms), `Formic_acid_dimer` (10 atoms), and
+`Benzene-water_complex` (15 atoms). For bulk, the
+[X23 structure archive](https://zenodo.org/records/8379098) provides CIFs;
+`CO2.cif` has 12 atoms and `NH3.cif` has 16 atoms per cell. These are PBE0+MBD
+geometries from an X23 study, so they are suitable for Torch–JAX parity, but
+should not be treated as the exact structures used for the paper's X23-DMC
+error table without checking the benchmark protocol.
+
+The paper specifies a slab dipole correction but reports no slab benchmark.
+For a boundary-condition check, read `NH3.cif` with ASE, call
+`atoms.center(vacuum=8.0, axis=2)`, set `atoms.pbc=[True, True, False]`, and
+write an `extxyz` file. This derived one-layer structure has 16
+atoms and is only a Torch–JAX parity case. Run one structure at a time, with
+no JIT or MD. In float64 energy-only runs, the maximum Torch–JAX total-energy
+differences were `2.12e-9` eV for the S22 water dimer, `3.19e-8` eV for bulk
+ammonia, and `3.19e-8` eV for the derived ammonia slab.
+
 ## Package overview
 
 MACE-JAX provides a JAX/Flax training stack for atomistic models, including

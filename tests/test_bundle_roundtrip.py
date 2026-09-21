@@ -72,3 +72,21 @@ def test_bundle_roundtrip(tmp_path):
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_bundle_loads_radial_state_without_new_prefactor(tmp_path):
+    config = _small_config()
+    config, _, _ = model_builder._normalize_atomic_config(config)
+    model = model_builder._build_jax_model(config, rngs=nnx.Rngs(0))
+    _, state = nnx.split(model)
+    payload = state_to_serializable_dict(state)
+    payload['radial_embedding']['basis_fn'].pop('_prefactor')
+
+    (tmp_path / 'config.json').write_text(json.dumps(config))
+    (tmp_path / 'params.msgpack').write_bytes(serialization.to_bytes(payload))
+
+    bundle = bundle_tools.load_model_bundle(str(tmp_path), dtype='float64')
+    np.testing.assert_array_equal(
+        np.asarray(bundle.params['radial_embedding']['basis_fn']['_prefactor']),
+        np.sqrt(2.0 / config['r_max']),
+    )

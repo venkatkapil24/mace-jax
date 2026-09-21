@@ -52,9 +52,7 @@ def _resolve_equivariance_config(equivariance_config, cueq_config=None):
         cueq_config = cueq_config()
     if equivariance_config is None and cueq_config is None:
         return None
-    return resolve_equivariance_config(
-        equivariance_config, cueq_config=cueq_config
-    )
+    return resolve_equivariance_config(equivariance_config, cueq_config=cueq_config)
 
 
 def _stringify_callable(value) -> str | None:
@@ -324,6 +322,19 @@ def _graph_to_data(
     head_attr = getattr(graph.globals, 'head', None)
     if head_attr is not None:
         data_dict['head'] = jnp.asarray(head_attr, dtype=jnp.int32).reshape(-1)
+
+    for name in ('total_charge', 'total_spin', 'fermi_level'):
+        value = getattr(graph.globals, name, None)
+        if value is not None:
+            data_dict[name] = jnp.asarray(value, dtype=positions.dtype).reshape(-1)
+    external_field = getattr(graph.globals, 'external_field', None)
+    if external_field is not None:
+        data_dict['external_field'] = jnp.asarray(
+            external_field, dtype=positions.dtype
+        ).reshape(-1, 3)
+    pbc = getattr(graph.globals, 'pbc', None)
+    if pbc is not None:
+        data_dict['pbc'] = jnp.asarray(pbc, dtype=jnp.bool_).reshape(-1, 3)
 
     return data_dict
 
@@ -671,9 +682,7 @@ def model(
             'learnable_atomic_energies is not supported by the Flax-based gin model.'
         )
 
-    equivariance_config = _resolve_equivariance_config(
-        equivariance_config, cueq_config
-    )
+    equivariance_config = _resolve_equivariance_config(equivariance_config, cueq_config)
     if equivariance_config is not None:
         kwargs['equivariance_config'] = equivariance_config
 

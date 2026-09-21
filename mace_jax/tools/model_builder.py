@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from e3nn_jax import Irreps
@@ -13,6 +14,7 @@ from mace_jax.adapters.nnx import resolve_gate_callable
 from mace_jax.data.utils import Configuration, graph_from_configuration
 from mace_jax.modules import interaction_classes, readout_classes
 from mace_jax.modules.models import MACE, ScaleShiftMACE
+from mace_jax.modules.polar_model import PolarMACE
 from mace_jax.modules.wrapper_ops import (
     EquivarianceConfig,
     resolve_equivariance_config,
@@ -259,23 +261,20 @@ def _build_jax_model(
         equivariance_config = resolve_equivariance_config(equivariance_config)
     elif cueq_config is not None:
         equivariance_config = resolve_equivariance_config(cueq_config=cueq_config)
-    elif (
-        config.get('cueq_config') is not None
-        or config.get('oeq_config') is not None
-    ):
+    elif config.get('cueq_config') is not None or config.get('oeq_config') is not None:
         equivariance_config = resolve_equivariance_config(
             cueq_config=config.get('cueq_config'),
             openeq_config=config.get('oeq_config'),
         )
-    elif config.get("cue_conv_fusion"):
+    elif config.get('cue_conv_fusion'):
         equivariance_config = EquivarianceConfig(
-            backend="cueq",
+            backend='cueq',
             optimize_channelwise=True,
-            conv_fusion=bool(config["cue_conv_fusion"]),
+            conv_fusion=bool(config['cue_conv_fusion']),
         )
     config, atomic_numbers, atomic_energies = _normalize_atomic_config(
         config,
-        dtype=np.float32,
+        dtype=np.float64 if jax.config.jax_enable_x64 else np.float32,
     )
     num_elements = len(atomic_numbers)
 
@@ -307,6 +306,10 @@ def _build_jax_model(
         collapse_hidden_irreps=(
             True if collapse_hidden_irreps is None else bool(collapse_hidden_irreps)
         ),
+        keep_last_layer_irreps=bool(config.get('keep_last_layer_irreps', False)),
+        spherical_harmonics_permutation=(
+            (1, 2, 0) if 'atomic_multipoles_max_l' in config else None
+        ),
         readout_cls=_readout(config.get('readout_cls', None)),
         gate=resolve_gate_callable(config.get('gate', None)),
         heads=config.get('heads'),
@@ -328,6 +331,42 @@ def _build_jax_model(
         common_kwargs['apply_cutoff'] = bool(config['apply_cutoff'])
 
     torch_class = config.get('torch_model_class', 'MACE')
+    if 'atomic_multipoles_max_l' in config:
+        return PolarMACE(
+            atomic_inter_scale=np.asarray(config.get('atomic_inter_scale', 1.0)),
+            atomic_inter_shift=np.asarray(config.get('atomic_inter_shift', 0.0)),
+            atomic_multipoles_max_l=int(config['atomic_multipoles_max_l']),
+            atomic_multipoles_smearing_width=float(
+                config['atomic_multipoles_smearing_width']
+            ),
+            field_feature_max_l=int(config['field_feature_max_l']),
+            field_feature_widths=tuple(config['field_feature_widths']),
+            field_feature_norms=(
+                tuple(config['field_feature_norms'])
+                if config.get('field_feature_norms') is not None
+                else None
+            ),
+            num_recursion_steps=int(config['num_recursion_steps']),
+            field_norm_factor=float(config.get('field_norm_factor', 1.0)),
+            field_si=bool(config.get('field_si', False)),
+            include_electrostatic_self_interaction=bool(
+                config.get('include_electrostatic_self_interaction', True)
+            ),
+            add_local_electron_energy=bool(
+                config.get('add_local_electron_energy', True)
+            ),
+            fixedpoint_update_config=config.get('fixedpoint_update_config'),
+            field_readout_config=config.get('field_readout_config'),
+            pbc_handling=config.get('pbc_handling', 'auto'),
+            kspace_cutoff_factor=float(config.get('kspace_cutoff_factor', 1.5)),
+            kspace_cutoff=(
+                float(config['kspace_cutoff'])
+                if config.get('kspace_cutoff') is not None
+                else None
+            ),
+            rngs=rngs,
+            **common_kwargs,
+        )
     if torch_class == 'ScaleShiftMACE' or 'atomic_inter_scale' in config:
         return ScaleShiftMACE(
             atomic_inter_scale=np.asarray(config.get('atomic_inter_scale', 1.0)),

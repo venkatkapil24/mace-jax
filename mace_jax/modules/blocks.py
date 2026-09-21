@@ -216,6 +216,7 @@ class NonLinearBiasReadoutBlock(nnx.Module):
         self.linear_mid = Linear(
             irreps_in=self.hidden_irreps,
             irreps_out=self.hidden_irreps,
+            biases=True,
             equivariance_config=self.equivariance_config,
             rngs=rngs,
         )
@@ -226,6 +227,7 @@ class NonLinearBiasReadoutBlock(nnx.Module):
         self.linear_2 = Linear(
             irreps_in=self.hidden_irreps,
             irreps_out=self.irrep_out,
+            biases=True,
             equivariance_config=self.equivariance_config,
             rngs=rngs,
         )

@@ -133,6 +133,8 @@ class MACE(nnx.Module):
         use_last_readout_only: bool = False,
         use_embedding_readout: bool = False,
         collapse_hidden_irreps: bool = True,
+        keep_last_layer_irreps: bool = False,
+        spherical_harmonics_permutation: tuple[int, int, int] | None = None,
         distance_transform: str = 'None',
         edge_irreps: Irreps | None = None,
         radial_MLP: Sequence[int] | None = None,
@@ -169,6 +171,8 @@ class MACE(nnx.Module):
         self.use_last_readout_only = use_last_readout_only
         self.use_embedding_readout = use_embedding_readout
         self.collapse_hidden_irreps = collapse_hidden_irreps
+        self.keep_last_layer_irreps = keep_last_layer_irreps
+        self.spherical_harmonics_permutation = spherical_harmonics_permutation
         self.distance_transform = distance_transform
         self.edge_irreps = edge_irreps
         self.radial_MLP = radial_MLP
@@ -207,7 +211,9 @@ class MACE(nnx.Module):
         self._mlp_irreps = mlp_irreps
         hidden_irreps_out = (
             Irreps(str(hidden_irreps[0]))
-            if self.num_interactions == 1 and self.collapse_hidden_irreps
+            if self.num_interactions == 1
+            and self.collapse_hidden_irreps
+            and not self.keep_last_layer_irreps
             else hidden_irreps
         )
 
@@ -341,7 +347,7 @@ class MACE(nnx.Module):
             )
 
         for idx in range(self.num_interactions - 1):
-            if idx == self.num_interactions - 2:
+            if idx == self.num_interactions - 2 and not self.keep_last_layer_irreps:
                 hidden_irreps_out = Irreps(str(hidden_irreps[0]))
             else:
                 hidden_irreps_out = hidden_irreps
@@ -455,7 +461,12 @@ class MACE(nnx.Module):
         ).astype(ctx.vectors.dtype)
 
         node_feats = self.node_embedding(node_attrs)
-        edge_attrs = self.spherical_harmonics(ctx.vectors)
+        sh_vectors = (
+            ctx.vectors[..., jnp.asarray(self.spherical_harmonics_permutation)]
+            if self.spherical_harmonics_permutation is not None
+            else ctx.vectors
+        )
+        edge_attrs = self.spherical_harmonics(sh_vectors)
         edge_feats, cutoff = self.radial_embedding(
             ctx.lengths,
             node_attrs,
@@ -659,7 +670,12 @@ class ScaleShiftMACE(MACE):
         ).astype(ctx.vectors.dtype)
 
         node_feats = self.node_embedding(node_attrs)
-        edge_attrs = self.spherical_harmonics(ctx.vectors)
+        sh_vectors = (
+            ctx.vectors[..., jnp.asarray(self.spherical_harmonics_permutation)]
+            if self.spherical_harmonics_permutation is not None
+            else ctx.vectors
+        )
+        edge_attrs = self.spherical_harmonics(sh_vectors)
         edge_feats, cutoff = self.radial_embedding(
             ctx.lengths,
             node_attrs,
