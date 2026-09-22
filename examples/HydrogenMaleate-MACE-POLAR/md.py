@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restartable 330 K periodic glycine MD: all POLAR or POLAR/TIP3P."""
+"""Restartable 330 K periodic hydrogen maleate MD: all POLAR or POLAR/TIP3P."""
 
 from __future__ import annotations
 
@@ -31,18 +31,17 @@ OH_R0 = 0.9572
 OH_K = 462750.4 * KJ_MOL_TO_EV / 100
 HOH_THETA0 = 1.82421813418
 HOH_K = 836.8 * KJ_MOL_TO_EV
-# Glycine atom order from PubChem CID 750. Cross LJ types approximate
-# standalone glycine with the corresponding AMBER ff14SB atomic types.
-# Values are sigma (Å) and epsilon (kJ/mol), from protein.ff14SB.xml.
-GLY_SIGMA = np.array([
-    3.066473387839048, 2.959921901149463, 3.249998523775958,
-    3.399669508423535, 3.399669508423535,
-    2.471353044121301, 2.471353044121301,
-    1.069078461768407, 1.069078461768407, 10.0,
+# Approximate AMBER-like cross Lennard-Jones types for PubChem atom order:
+# four carboxyl oxygens, four carbons, two vinyl hydrogens, acidic hydrogen.
+SOLUTE_SIGMA = np.array([
+    3.066473387839048, 2.959921901149463, 2.959921901149463,
+    2.959921901149463, 3.399669508423535, 3.399669508423535,
+    3.399669508423535, 3.399669508423535, 2.471353044121301,
+    2.471353044121301, 10.0,
 ])
-GLY_EPS = np.array([
-    0.8803136, 0.87864, 0.71128, 0.4577296, 0.359824,
-    0.0656888, 0.0656888, 0.0656888, 0.0656888, 0.0,
+SOLUTE_EPS = np.array([
+    0.8803136, 0.87864, 0.87864, 0.87864, 0.359824, 0.359824,
+    0.4577296, 0.4577296, 0.0656888, 0.0656888, 0.0,
 ]) * KJ_MOL_TO_EV
 
 
@@ -65,7 +64,7 @@ def generate_velocities(atoms, temperature, seed):
 def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
                  restraint_radius, restraint_k):
     box = float(atoms.cell[0, 0])
-    n_qm = len(atoms) if mode_name == 'polar' else 10 + 3*qm_water_count
+    n_qm = len(atoms) if mode_name == 'polar' else 11 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
     box, periodic_mode, data, graphdef, params, neighbor_fn, shift_fn = (
         initialize_model(qm_atoms, bundle)
@@ -85,8 +84,8 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
     k_vectors = jnp.asarray(2 * math.pi / box * k_int, dtype=jnp.float64)
     k2 = jnp.sum(k_vectors**2, axis=1)
     k_weights = jnp.exp(-k2 / (4 * alpha**2)) / k2
-    cross_sigma = jnp.asarray((GLY_SIGMA + TIP3P_SIGMA) / 2)
-    cross_epsilon = jnp.asarray(np.sqrt(GLY_EPS * TIP3P_EPS))
+    cross_sigma = jnp.asarray((SOLUTE_SIGMA + TIP3P_SIGMA) / 2)
+    cross_epsilon = jnp.asarray(np.sqrt(SOLUTE_EPS * TIP3P_EPS))
 
     def lj(r, sigma, epsilon):
         x6 = (sigma / r) ** 6
@@ -104,13 +103,13 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         mm_o = waters[:, 0]
         oo = minimum_image(mm_o[mm_o_pairs[0]] - mm_o[mm_o_pairs[1]], box)
         mm_lj = jnp.sum(lj(jnp.linalg.norm(oo, axis=-1), TIP3P_SIGMA, TIP3P_EPS))
-        gly_cross = minimum_image(qm_r[:10, None] - mm_o[None], box)
-        gly_cross_r = jnp.linalg.norm(gly_cross, axis=-1)
+        solute_cross = minimum_image(qm_r[:11, None] - mm_o[None], box)
+        solute_cross_r = jnp.linalg.norm(solute_cross, axis=-1)
         cross_lj = jnp.sum(lj(
-            gly_cross_r, cross_sigma[:, None], cross_epsilon[:, None]
+            solute_cross_r, cross_sigma[:, None], cross_epsilon[:, None]
         ))
         # QM water O - MM water O uses the same TIP3P Lennard-Jones type.
-        qm_water_o = qm_r[10::3]
+        qm_water_o = qm_r[11::3]
         water_cross = minimum_image(qm_water_o[:, None] - mm_o[None], box)
         cross_lj += jnp.sum(lj(
             jnp.linalg.norm(water_cross, axis=-1), TIP3P_SIGMA, TIP3P_EPS
@@ -141,9 +140,9 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
 
     def boundary_restraint(qm_r):
         # Restrain only first-shell water oxygens, with zero energy/force
-        # inside the shell. The closest glycine O/O/N site moves with glycine.
+        # inside the shell. The closest solute oxygen moves with the solute.
         delta = minimum_image(
-            qm_r[10::3, None] - qm_r[jnp.asarray([0, 1, 2])][None], box
+            qm_r[11::3, None] - qm_r[jnp.asarray([0, 1, 2, 3])][None], box
         )
         nearest = jnp.linalg.norm(delta, axis=-1).min(axis=-1)
         excess = jnp.maximum(nearest - restraint_radius, 0.0)
@@ -175,20 +174,21 @@ def write_chunk(args, atoms, position_series, energy_series, kinetic_series, sta
     for i in range(len(energy_series)):
         step = start_step + i + 1
         positions = position_series[i]
-        oh = positions[9] - positions[0]
-        nh = positions[9] - positions[2]
-        oh -= box*np.rint(oh/box)
-        nh -= box*np.rint(nh/box)
-        oh_distance = float(np.linalg.norm(oh))
-        nh_distance = float(np.linalg.norm(nh))
+        h_to_o = positions[:4] - positions[10]
+        h_to_o -= box*np.rint(h_to_o/box)
+        h_to_o = np.linalg.norm(h_to_o, axis=1)
+        left_h = float(h_to_o[:2].min())
+        right_h = float(h_to_o[2:].min())
+        proton_coordinate = right_h - left_h
         if step % args.save_interval == 0 or step == args.steps:
             frame = atoms.copy()
             frame.positions = positions
             frame.info['time_fs'] = step * args.timestep_fs
             frame.info['potential_energy_eV'] = float(energy_series[i])
             frame.info['kinetic_energy_eV'] = float(kinetic_series[i])
-            frame.info['glycine_OH_angstrom'] = oh_distance
-            frame.info['glycine_NH_angstrom'] = nh_distance
+            frame.info['left_carboxyl_H_angstrom'] = left_h
+            frame.info['right_carboxyl_H_angstrom'] = right_h
+            frame.info['proton_coordinate_angstrom'] = proton_coordinate
             frames.append(frame)
         if step % args.report_interval == 0 or step == args.steps:
             samples.append({
@@ -196,8 +196,9 @@ def write_chunk(args, atoms, position_series, energy_series, kinetic_series, sta
                 'time_ps': step*args.timestep_fs/1000,
                 'potential_eV': float(energy_series[i]),
                 'temperature_K': float(2*kinetic_series[i]/((3*len(atoms)-3)*units.kB)),
-                'glycine_OH_angstrom': oh_distance,
-                'glycine_NH_angstrom': nh_distance,
+                'left_carboxyl_H_angstrom': left_h,
+                'right_carboxyl_H_angstrom': right_h,
+                'proton_coordinate_angstrom': proton_coordinate,
             })
     if frames:
         tmp = args.output / 'chunks' / f'{start_step+len(energy_series):08d}.tmp.xyz'
@@ -232,17 +233,18 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / 'chunks').mkdir(exist_ok=True)
     atoms = read(args.initial)
-    if len(atoms) != 166:
-        raise ValueError('Expected 10 glycine atoms and 52 waters')
+    if len(atoms) != 167:
+        raise ValueError('Expected 11 hydrogen maleate atoms and 52 waters')
     if args.mode == 'mlmm':
         if not 1 <= args.qm_water_count < 52:
             raise ValueError('ML/MM requires a nonempty first-shell QM water region')
         if int(atoms.info.get('qm_water_count', -1)) != args.qm_water_count:
             raise ValueError('QM water count differs from initial structure metadata')
-    initial_oh = float(np.linalg.norm(atoms.positions[0]-atoms.positions[9]))
-    initial_nh = float(np.linalg.norm(atoms.positions[2]-atoms.positions[9]))
-    if not initial_oh < initial_nh:
-        raise ValueError('Initial glycine is not neutral')
+    initial_h_to_o = np.linalg.norm(atoms.positions[:4]-atoms.positions[10], axis=1)
+    if not initial_h_to_o[:2].min() < initial_h_to_o[2:].min():
+        raise ValueError('Initial hydrogen maleate proton is not on the left carboxyl')
+    if int(atoms.info.get('qm_charge', atoms.info.get('charge', 0))) != -1:
+        raise ValueError('Hydrogen maleate QM region must have charge -1')
     write(args.output / 'initial.xyz', atoms, format='extxyz')
     force_eval, params, neighbor_fn, shift_fn, n_qm = build_energy(
         atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,

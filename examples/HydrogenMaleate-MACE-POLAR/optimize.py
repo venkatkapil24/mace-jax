@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fixed-cell ASE BFGS of neutral aqueous glycine with MACE-POLAR."""
+"""Fixed-cell ASE BFGS of aqueous hydrogen maleate anion with MACE-POLAR."""
 
 from __future__ import annotations
 
@@ -16,9 +16,8 @@ from ase.calculators.calculator import Calculator, all_changes
 from ase.constraints import FixBondLength
 from ase.io import read, write
 from ase.optimize import BFGS
-from flax import nnx
-
 from common import graph_edges, initialize_model
+from flax import nnx
 
 
 class PolarCalculator(Calculator):
@@ -75,12 +74,10 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     atoms = read(args.initial)
-    if len(atoms) != 166 or list(atoms.numbers[:10]) != [8, 8, 7, 6, 6, 1, 1, 1, 1, 1]:
-        raise ValueError('Expected glycine atom order followed by 52 intact waters')
-    # Constrain only the donor O-H length while relaxing every other degree
-    # of freedom. Otherwise the requested neutral initial state can disappear
-    # during BFGS, before the MD starts.
-    atoms.set_constraint(FixBondLength(0, 9))
+    if len(atoms) != 167 or list(atoms.numbers[:11]) != [8, 8, 8, 8, 6, 6, 6, 6, 1, 1, 1]:
+        raise ValueError('Expected hydrogen maleate followed by 52 intact waters')
+    # Preserve the initially localized O-H state during preparation only.
+    atoms.set_constraint(FixBondLength(0, 10))
     atoms.calc = PolarCalculator(atoms, args.bundle)
     started = time.perf_counter()
     history = []
@@ -104,22 +101,23 @@ def main():
         if history[-1][0] != dyn.nsteps:
             record()
     atoms.set_constraint()
-    oh = float(np.linalg.norm(atoms.positions[0] - atoms.positions[9]))
-    nh = float(np.linalg.norm(atoms.positions[2] - atoms.positions[9]))
-    if oh >= nh or oh > 1.25:
-        raise RuntimeError(f'BFGS starting state is not neutral glycine: O-H={oh}, N-H={nh}')
+    h_distances = np.linalg.norm(atoms.positions[:4] - atoms.positions[10], axis=1)
+    left_h = float(h_distances[:2].min())
+    right_h = float(h_distances[2:].min())
+    if left_h >= right_h or left_h > 1.25:
+        raise RuntimeError(f'BFGS lost localized hydrogen maleate: left={left_h}, right={right_h}')
     atoms.calc = None
     if converged:
-        write(args.output / 'optimized-neutral.xyz', atoms, format='extxyz')
+        write(args.output / 'optimized-anion.xyz', atoms, format='extxyz')
     result = {
         'converged': converged,
         'steps': dyn.nsteps,
         'fmax_target_eV_per_angstrom': args.fmax,
         'final_projected_fmax_eV_per_angstrom': history[-1][3],
         'initial_structure': str(args.initial),
-        'optimized_structure': str(args.output / 'optimized-neutral.xyz'),
-        'neutral_OH_distance_angstrom': oh,
-        'neutral_NH_distance_angstrom': nh,
+        'optimized_structure': str(args.output / 'optimized-anion.xyz'),
+        'left_carboxyl_H_distance_angstrom': left_h,
+        'right_carboxyl_H_distance_angstrom': right_h,
         'seconds': time.perf_counter() - started,
         'note': 'O-H bond constrained during BFGS; constraint removed for MD.',
     }

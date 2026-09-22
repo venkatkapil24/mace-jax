@@ -1,0 +1,34 @@
+{
+  "solute_source": "https://pubchem.ncbi.nlm.nih.gov/compound/11966254",
+  "box_angstrom": 11.76,
+  "water_source": "previous equilibrated 52-water cell before glycine removal",
+  "solute_atom_indices": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "oxygen_indices": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "acid_hydrogen_index": 10,
+  "initial_H_to_O_angstrom": [
+    0.9809424906690511,
+    2.934620246753513,
+    1.5103461208517157,
+    3.378947160903363
+  ],
+  "minimum_solute_water_distance_angstrom": 2.322117494255987,
+  "charge": -1,
+  "spin_multiplicity": 1
+}

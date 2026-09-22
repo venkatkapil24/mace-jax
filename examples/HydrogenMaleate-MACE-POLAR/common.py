@@ -1,4 +1,4 @@
-"""Shared periodic MACE-POLAR helpers for the glycine examples."""
+"""Shared periodic MACE-POLAR helpers for the hydrogen maleate example."""
 
 from __future__ import annotations
 

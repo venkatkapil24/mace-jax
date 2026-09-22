@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Put first-shell waters next to glycine for a fixed POLAR/MM partition."""
+"""Put first-shell waters next to hydrogen maleate for a fixed POLAR/MM partition."""
 
 from __future__ import annotations
 
@@ -18,21 +18,21 @@ def main():
     parser.add_argument('--cutoff', type=float, default=3.8)
     args = parser.parse_args()
     atoms = read(args.optimized)
-    if len(atoms) != 166:
-        raise ValueError('Expected glycine and 52 complete waters')
+    if len(atoms) != 167:
+        raise ValueError('Expected hydrogen maleate and 52 complete waters')
     box = float(atoms.cell[0, 0])
     # First shell is defined by each water oxygen's closest periodic distance
-    # to the three polar glycine atoms: acid O, carbonyl O, and N.
-    delta = atoms.positions[10::3, None] - atoms.positions[[0, 1, 2]][None]
+    # to the three polar hydrogen maleate atoms: acid O, carbonyl O, and N.
+    delta = atoms.positions[11::3, None] - atoms.positions[[0, 1, 2, 3]][None]
     delta -= box * np.rint(delta / box)
     distances = np.linalg.norm(delta, axis=-1).min(axis=-1)
     qm_waters = np.flatnonzero(distances < args.cutoff)
     mm_waters = np.flatnonzero(distances >= args.cutoff)
     if not 1 <= len(qm_waters) < 52:
         raise ValueError(f'Unexpected first-shell count: {len(qm_waters)}')
-    order = list(range(10))
+    order = list(range(11))
     for water in np.concatenate((qm_waters, mm_waters)):
-        order.extend(range(10 + 3*int(water), 13 + 3*int(water)))
+        order.extend(range(11 + 3*int(water), 14 + 3*int(water)))
     ordered = atoms[order]
     ordered.info['qm_water_count'] = int(len(qm_waters))
     args.output.parent.mkdir(parents=True, exist_ok=True)
