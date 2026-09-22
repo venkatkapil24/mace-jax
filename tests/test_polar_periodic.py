@@ -3,12 +3,59 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 from graph_longrange.energy import GTOElectrostaticEnergy
 from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
 
 from mace_jax.modules.polar_periodic import PeriodicPolarElectrostatics
+
+
+@pytest.mark.parametrize(
+    ('mode', 'flags'),
+    [
+        ('pbc', [True, True, True]),
+        ('slab', [True, True, False]),
+        ('molecule_in_box', [False, False, False]),
+    ],
+)
+@pytest.mark.parametrize('include_energy_self_interaction', [True, False])
+def test_periodic_fixed_coefficients_jit_energy_fields_and_gradients(
+    mode, flags, include_energy_self_interaction
+):
+    jax.config.update('jax_enable_x64', True)
+    model = PeriodicPolarElectrostatics(
+        1,
+        1.5,
+        1,
+        (1.5, 3.0),
+        include_energy_self_interaction=include_energy_self_interaction,
+    )
+    positions = jnp.asarray([[0.3, 0.5, 0.8], [1.4, 1.2, 1.7]])
+    cell = jnp.diag(jnp.asarray([7.0, 8.0, 9.0]))[None]
+    density = jnp.asarray([[0.4, -0.1, 0.2, 0.3], [-0.3, 0.2, 0.1, -0.1]])
+    batch = jnp.zeros(2, dtype=jnp.int32)
+    pbc = jnp.asarray([flags])
+    coefficients = model.prepare_coefficients(cell)
+
+    def outputs(pos, current_cell):
+        cache = model.precompute(pos, batch, current_cell, coefficients=coefficients)
+        return (
+            model.coulomb_energy(density, cache, mode=mode, pbc=pbc),
+            model.field_features(density, cache, mode=mode, pbc=pbc),
+        )
+
+    eager = outputs(positions, cell)
+    compiled = jax.jit(outputs)(positions, cell)
+    for expected, actual in zip(eager, compiled):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-10)
+
+    energy = lambda pos, current_cell: outputs(pos, current_cell)[0].sum()
+    eager_grads = jax.grad(energy, argnums=(0, 1))(positions, cell)
+    compiled_grads = jax.jit(jax.grad(energy, argnums=(0, 1)))(positions, cell)
+    for expected, actual in zip(eager_grads, compiled_grads):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-10)
 
 
 def test_periodic_field_energy_and_position_gradient():

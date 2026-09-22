@@ -1,10 +1,11 @@
-"""Native eager JAX implementation of the MACE-POLAR response architecture."""
+"""Native JAX implementation of the MACE-POLAR response architecture."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 from e3nn_jax import Irreps
 from flax import nnx
 
@@ -171,17 +172,66 @@ class PolarMACE(ScaleShiftMACE):
                 )
         self.field_feature_norms = jnp.asarray(expanded_norms)
 
-    def __call__(
-        self, data: dict[str, jnp.ndarray], *, debug: bool = False
-    ) -> dict[str, Any]:
-        pbc = data.get('pbc')
-        periodic = self.pbc_handling in (
+    def prepare_jit_data(
+        self,
+        data: dict[str, jnp.ndarray],
+        *,
+        pbc_handling: str | None = None,
+    ) -> tuple[str, dict[str, jnp.ndarray]]:
+        """Resolve the electrostatics mode and reciprocal indices on the host.
+
+        Pass the returned mode as ``pbc_handling`` to the compiled model call.
+        The coefficient set is fixed for the reference cell; changes that alter
+        that set require preparing the data again.
+        """
+        mode = self.pbc_handling if pbc_handling is None else pbc_handling
+        if mode == 'auto':
+            pbc = data.get('pbc')
+            mode = (
+                'mixed_periodic'
+                if pbc is not None and bool(np.any(np.asarray(pbc)))
+                else 'realspace'
+            )
+        if mode not in (
+            'realspace',
             'pbc',
             'slab',
             'molecule_in_box',
             'mixed_periodic',
-        ) or (self.pbc_handling == 'auto' and pbc is not None and bool(jnp.any(pbc)))
-        if self.pbc_handling not in (
+        ):
+            raise NotImplementedError(
+                f'POLAR electrostatics mode {mode!r} is not ported yet'
+            )
+        prepared = dict(data)
+        if mode != 'realspace':
+            if data.get('pbc') is None:
+                raise ValueError('Periodic POLAR requires per-graph pbc data')
+            coefficients, k_batch, k0_mask = (
+                self.periodic_electrostatics.prepare_coefficients(
+                    data.get('reference_cell', data['cell'])
+                )
+            )
+            prepared['kspace_coefficients'] = coefficients
+            prepared['kspace_batch'] = k_batch
+            prepared['kspace_k0_mask'] = k0_mask
+        return mode, prepared
+
+    def __call__(
+        self,
+        data: dict[str, jnp.ndarray],
+        *,
+        debug: bool = False,
+        pbc_handling: str | None = None,
+    ) -> dict[str, Any]:
+        mode = self.pbc_handling if pbc_handling is None else pbc_handling
+        pbc = data.get('pbc')
+        periodic = mode in (
+            'pbc',
+            'slab',
+            'molecule_in_box',
+            'mixed_periodic',
+        ) or (mode == 'auto' and pbc is not None and bool(jnp.any(pbc)))
+        if mode not in (
             'realspace',
             'auto',
             'pbc',
@@ -190,24 +240,31 @@ class PolarMACE(ScaleShiftMACE):
             'mixed_periodic',
         ):
             raise NotImplementedError(
-                f'POLAR electrostatics mode {self.pbc_handling!r} is not ported yet'
+                f'POLAR electrostatics mode {mode!r} is not ported yet'
             )
-        periodic_mode = (
-            'mixed_periodic' if self.pbc_handling == 'auto' else self.pbc_handling
-        )
+        periodic_mode = 'mixed_periodic' if mode == 'auto' else mode
         if periodic and pbc is None:
             raise ValueError('Periodic POLAR requires per-graph pbc data')
 
         backbone = ScaleShiftMACE._energy_fn(self, data, compute_node_feats=True)
         batch = data['batch']
         positions = data['positions']
-        periodic_cache = (
-            self.periodic_electrostatics.precompute(
-                positions, batch, data['cell'], data.get('reference_cell')
+        periodic_cache = None
+        if periodic:
+            coefficient_keys = ('kspace_coefficients', 'kspace_batch', 'kspace_k0_mask')
+            provided = [key in data for key in coefficient_keys]
+            if any(provided) and not all(provided):
+                raise ValueError('Periodic POLAR requires all three kspace arrays')
+            coefficients = (
+                tuple(data[key] for key in coefficient_keys) if all(provided) else None
             )
-            if periodic
-            else None
-        )
+            periodic_cache = self.periodic_electrostatics.precompute(
+                positions,
+                batch,
+                data['cell'],
+                data.get('reference_cell'),
+                coefficients=coefficients,
+            )
         node_attrs = data['node_attrs']
         num_graphs = int(data['ptr'].shape[0] - 1)
         node_feats_list = jnp.split(

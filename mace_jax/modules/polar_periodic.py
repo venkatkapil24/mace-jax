@@ -1,4 +1,4 @@
-"""Eager JAX Fourier GTO electrostatics and finite-size corrections for POLAR."""
+"""JAX Fourier GTO electrostatics and finite-size corrections for POLAR."""
 
 from __future__ import annotations
 
@@ -55,6 +55,16 @@ def _half_space_coefficients(
         jnp.asarray(np.concatenate(selected, axis=0), dtype=cell.dtype),
         jnp.asarray(graph_ids, dtype=jnp.int32),
         jnp.asarray(origin_flags, dtype=cell.dtype),
+    )
+
+
+def _gather_self_terms(
+    source_feats: jnp.ndarray, indices: tuple[int, ...]
+) -> jnp.ndarray:
+    # Repeated advanced indices changed the field result when fused under JIT.
+    # Fixed slices preserve the eager calculation and its derivatives.
+    return jnp.concatenate(
+        [source_feats[:, index : index + 1] for index in indices], axis=-1
     )
 
 
@@ -163,6 +173,12 @@ class PeriodicPolarElectrostatics:
             (density_width,),
             feature_normalization='multipoles',
         )
+        self.field_self_index_tuple = tuple(
+            np.asarray(self.field_self_indices).tolist()
+        )
+        self.energy_self_index_tuple = tuple(
+            np.asarray(self.energy_self_indices).tolist()
+        )
         self.output_permutation = jnp.asarray(
             [
                 radial * (feature_max_l + 1) ** 2 + ell**2 + m
@@ -176,18 +192,28 @@ class PeriodicPolarElectrostatics:
             feature_max_l, tuple(feature_widths)
         )
 
+    def prepare_coefficients(
+        self, reference_cell: jnp.ndarray
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Enumerate the fixed reciprocal indices outside a JIT-compiled call."""
+        return _half_space_coefficients(
+            self.kspace_cutoff, jnp.asarray(reference_cell).reshape(-1, 3, 3)
+        )
+
     def precompute(
         self,
         positions: jnp.ndarray,
         batch: jnp.ndarray,
         cell: jnp.ndarray,
         reference_cell: jnp.ndarray | None = None,
+        coefficients: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray] | None = None,
     ) -> dict[str, jnp.ndarray]:
         cell = cell.reshape(-1, 3, 3)
-        coefficients, k_batch, k0_mask = _half_space_coefficients(
-            self.kspace_cutoff,
-            cell if reference_cell is None else reference_cell.reshape(-1, 3, 3),
-        )
+        if coefficients is None:
+            coefficients = self.prepare_coefficients(
+                cell if reference_cell is None else reference_cell
+            )
+        coefficients, k_batch, k0_mask = coefficients
         reciprocal = 2 * math.pi * jnp.linalg.inv(jnp.swapaxes(cell, -1, -2))
         k_vectors = jnp.einsum('ki,kij->kj', coefficients, reciprocal[k_batch])
         k_norm2 = jnp.sum(k_vectors * k_vectors, axis=-1)
@@ -373,9 +399,14 @@ class PeriodicPolarElectrostatics:
         features = projected[:, self.output_permutation]
         if not self.include_field_self_interaction:
             self_terms = (
-                source_feats[:, self.field_self_indices] * self.field_self_values
+                _gather_self_terms(source_feats, self.field_self_index_tuple)
+                * self.field_self_values
             )
-            features = features.at[:, : self_terms.shape[-1]].add(-self_terms)
+            self_terms = jnp.pad(
+                self_terms,
+                ((0, 0), (0, features.shape[-1] - self_terms.shape[-1])),
+            )
+            features = features - self_terms
         if mode != 'pbc':
             if pbc is None:
                 raise ValueError('pbc is required for correction modes')
@@ -399,7 +430,8 @@ class PeriodicPolarElectrostatics:
         energy = 0.5 * cache['volume'] * energy_k / (2 * math.pi) ** 6
         if not self.include_energy_self_interaction:
             self_terms = (
-                source_feats[:, self.energy_self_indices] * self.energy_self_values
+                _gather_self_terms(source_feats, self.energy_self_index_tuple)
+                * self.energy_self_values
             )
             node_energy = 0.5 * jnp.sum(
                 source_feats[:, : self_terms.shape[-1]] * self_terms, axis=-1

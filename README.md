@@ -85,15 +85,16 @@ is byte identical and its maximum force difference is `1.8e-15`.
 The workarounds are marked in the JSON report. These runs verify TorchAX
 execution of the Torch model. The native JAX port has its own comparison below.
 
-## Native eager MACE-POLAR-1-M
+## Native MACE-POLAR-1-M
 
 `mace_jax.modules.polar_model.PolarMACE` implements the released POLAR-1-M
 backbone, spin charge response, local electron energy, and Gaussian multipole
 electrostatics in JAX. Its electrostatic modes cover open boundaries, bulk
 periodic cells, slabs, molecules in boxes, and mixed periodic batches. Graph
 inputs carry total charge, spin multiplicity, external field, and PBC flags.
-Energy, forces, and stress are evaluated with JAX autodiff. The port
-and its verifier run eagerly; neither calls `jax.jit` or `torch.compile`.
+Energy, forces, and stress are evaluated with JAX autodiff. The verifier runs
+eagerly by default and accepts `--jit` for compiled JAX inference. Torch runs
+without `torch.compile` in either case.
 
 Convert the released Torch checkpoint with the shared float64 environment:
 
@@ -143,6 +144,32 @@ evaluator also has a Torch parity test for a mixed bulk and slab batch.
 
 To verify the serialized artifact instead of an in-memory import, add
 `--jax-bundle /tmp/MACE-POLAR-1-M-jax.msgpack` to the comparison command.
+
+For compiled inference, resolve `auto` mode and enumerate the reciprocal
+indices once on the host. Pass the resolved mode as a static argument to the
+model call. For example, with a loaded `PolarMACE` model and JAX input data:
+
+```python
+import jax
+from flax import nnx
+
+mode, prepared_data = model.prepare_jit_data(data)
+graphdef, state = nnx.split(model)
+predict = jax.jit(
+    lambda params, inputs: nnx.merge(graphdef, params)(
+        inputs, compute_force=True, pbc_handling=mode
+    )
+)
+outputs = predict(state, prepared_data)
+```
+
+`prepare_jit_data` uses the reference cell to choose a fixed set of integer
+reciprocal indices; the compiled calculation still uses the live cell for
+reciprocal vectors, energy, forces, and stress. Reprepare the indices if the
+cell changes enough to alter the reciprocal cutoff set. Different index counts
+compile as different input shapes; no reciprocal-vector padding is used. Add
+`--jit` to `scripts/verify_polar_backbone.py` to compare a compiled run against
+Torch for any supported electrostatics mode.
 
 ### Small static evaluation panel
 

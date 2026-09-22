@@ -39,6 +39,9 @@ def main() -> int:
     parser.add_argument('--field', nargs=3, type=float, default=(0.0, 0.0, 0.0))
     parser.add_argument('--fermi-level', type=float, default=0.0)
     parser.add_argument('--jax-bundle', type=Path)
+    parser.add_argument(
+        '--jit', action='store_true', help='Compile the native JAX model'
+    )
     parser.add_argument('--debug', action='store_true')
     parser.add_argument(
         '--pbc-handling',
@@ -271,12 +274,28 @@ def main() -> int:
         )
         ScaleShiftMACE._energy_fn = lambda _self, _data, **_kwargs: reference_backbone
     try:
-        candidate = jax_model(
-            jax_data,
-            compute_force=args.compute_force or args.compute_stress,
-            compute_stress=args.compute_stress,
-            debug=args.debug,
-        )
+        if args.jit:
+            mode, jax_data = jax_model.prepare_jit_data(
+                jax_data, pbc_handling=args.pbc_handling
+            )
+            graphdef, state = nnx.split(jax_model)
+            candidate = jax.jit(
+                lambda params, payload: nnx.merge(graphdef, params)(
+                    payload,
+                    compute_force=args.compute_force or args.compute_stress,
+                    compute_stress=args.compute_stress,
+                    debug=args.debug,
+                    pbc_handling=mode,
+                )
+            )(state, jax_data)
+            jax.block_until_ready(candidate['energy'])
+        else:
+            candidate = jax_model(
+                jax_data,
+                compute_force=args.compute_force or args.compute_stress,
+                compute_stress=args.compute_stress,
+                debug=args.debug,
+            )
     finally:
         ScaleShiftMACE._energy_fn = original_backbone
     checks = {
