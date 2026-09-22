@@ -197,6 +197,13 @@ need validation before using this for simulations. The MM Ewald implementation
 is specialized to one neutral water in this box and omits real-space image terms
 that are negligible for the chosen Ewald settings.
 
+For charged ML/MM partitions, all POLAR Fourier terms omit the divergent
+`G=0` component and therefore use a uniform neutralizing background. When the
+subtracted MM subsystem itself has nonzero charge, the restored point-charge
+Ewald term must include `-k_e*pi*Q_MM^2/(2*alpha^2*V)`. The reusable
+`ewald_neutralizing_background_energy` helper implements this correction, and
+the ML/MM examples include it. It is zero for neutral TIP3P-only MM regions.
+
 ### Small static evaluation panel
 
 For a laptop-sized check across boundary conditions, the verifier also accepts

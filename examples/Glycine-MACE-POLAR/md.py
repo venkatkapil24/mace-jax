@@ -15,12 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 from ase import units
 from ase.io import read, write
+from common import graph_edges, initialize_model
 from flax import nnx
 from jax.scipy.special import erf, erfc
 
-from common import graph_edges, initialize_model
 from mace_jax.modules.polar_electrostatics import FIELD_CONSTANT
-
+from mace_jax.modules.polar_periodic import ewald_neutralizing_background_energy
 
 COULOMB = FIELD_CONSTANT / (4 * math.pi)
 KJ_MOL_TO_EV = 1 / 96.48533212331002
@@ -125,13 +125,19 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         c, s = jnp.cos(phase) @ mm_charges, jnp.sin(phase) @ mm_charges
         reciprocal = COULOMB*2*math.pi/box**3*jnp.sum(k_weights*(c*c+s*s))
         self_energy = -COULOMB*alpha/math.sqrt(math.pi)*jnp.sum(mm_charges**2)
+        background = ewald_neutralizing_background_energy(
+            jnp.sum(mm_charges), box**3, alpha
+        )
         excluded = minimum_image(mm_r[exception_i] - mm_r[exception_j], box)
         excluded_r = jnp.linalg.norm(excluded, axis=-1)
         exceptions = -COULOMB*jnp.sum(
             mm_charges[exception_i]*mm_charges[exception_j]
             *erf(alpha*excluded_r)/excluded_r
         )
-        return bonded + mm_lj + cross_lj + real + reciprocal + self_energy + exceptions
+        return (
+            bonded + mm_lj + cross_lj + real + reciprocal + self_energy
+            + background + exceptions
+        )
 
     def boundary_restraint(qm_r):
         # Restrain only first-shell water oxygens, with zero energy/force

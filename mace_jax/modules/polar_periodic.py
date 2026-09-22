@@ -20,6 +20,33 @@ from .polar_electrostatics import (
 )
 
 
+def ewald_neutralizing_background_energy(
+    total_charge: jnp.ndarray | float,
+    volume: jnp.ndarray | float,
+    alpha: jnp.ndarray | float,
+) -> jnp.ndarray:
+    """Energy of the uniform background used for a charged Ewald sum.
+
+    The reciprocal ``G=0`` component is undefined when the explicit point
+    charges have a nonzero total charge. Omitting that component is equivalent
+    to adding a uniform compensating charge density. In the conventional
+    real/reciprocal Ewald decomposition its energy is
+
+        -k_e * pi * Q**2 / (2 * alpha**2 * V).
+
+    ``total_charge`` is in units of the elementary charge, ``volume`` in
+    Angstrom cubed, and ``alpha`` in inverse Angstrom; the result is in eV.
+    The term has no position forces for a fixed cell, but must be included in
+    energy and cell derivatives whenever a non-neutral MM Ewald term replaces
+    the MM-only part of the zero-mean POLAR Fourier energy.
+    """
+    charge = jnp.asarray(total_charge)
+    volume = jnp.asarray(volume, dtype=charge.dtype)
+    alpha = jnp.asarray(alpha, dtype=charge.dtype)
+    coulomb = FIELD_CONSTANT / (4 * math.pi)
+    return -coulomb * math.pi * charge**2 / (2 * alpha**2 * volume)
+
+
 def _half_space_coefficients(
     cutoff: float, cell: jnp.ndarray
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -428,7 +455,11 @@ class PeriodicPolarElectrostatics:
         The point-charge MM/MM Fourier term is removed here. A conventional
         point-charge Ewald solver supplies it with its own self and exclusion
         corrections; the MM density still contributes to the shared potential.
-        This proof of concept handles one periodic graph.
+        All Fourier terms omit ``G=0``. If the MM charges are not neutral, the
+        restored Ewald energy must therefore include
+        :func:`ewald_neutralizing_background_energy` to use the same uniform
+        background convention. This proof of concept handles one periodic
+        graph.
         """
         qm_density, _ = self._density_and_potential(source_feats, cache)
         mm_density = self.point_charge_density(mm_positions, mm_charges, cache)

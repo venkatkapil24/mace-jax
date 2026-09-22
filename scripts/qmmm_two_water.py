@@ -26,6 +26,7 @@ from mace_jax.data.utils import (
     graph_from_configuration,
 )
 from mace_jax.modules.polar_electrostatics import FIELD_CONSTANT
+from mace_jax.modules.polar_periodic import ewald_neutralizing_background_energy
 from mace_jax.tools.bundle import load_model_bundle
 
 COULOMB_EV_ANGSTROM = FIELD_CONSTANT / (4 * math.pi)
@@ -88,6 +89,9 @@ def tip3p_periodic_electrostatics(
     self_energy = (
         -COULOMB_EV_ANGSTROM * alpha / math.sqrt(math.pi) * jnp.sum(charges**2)
     )
+    background = ewald_neutralizing_background_energy(
+        jnp.sum(charges), box_length**3, alpha
+    )
     pair_i = jnp.asarray([0, 0, 1])
     pair_j = jnp.asarray([1, 2, 2])
     dr = mm_positions[pair_i] - mm_positions[pair_j]
@@ -96,7 +100,7 @@ def tip3p_periodic_electrostatics(
     exceptions = -COULOMB_EV_ANGSTROM * jnp.sum(
         charges[pair_i] * charges[pair_j] * erf(alpha * distances) / distances
     )
-    return reciprocal + self_energy + exceptions
+    return reciprocal + self_energy + background + exceptions
 
 
 def cross_oxygen_lj(

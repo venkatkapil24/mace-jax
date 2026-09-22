@@ -4,8 +4,90 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.scipy.special import erfc
 
-from mace_jax.modules.polar_periodic import PeriodicPolarElectrostatics
+from mace_jax.modules.polar_electrostatics import FIELD_CONSTANT
+from mace_jax.modules.polar_periodic import (
+    PeriodicPolarElectrostatics,
+    ewald_neutralizing_background_energy,
+)
+
+
+def _single_charge_ewald(alpha, *, charge=0.7, box=9.0, nmax=3, kmax=12):
+    """Converged one-charge cubic Ewald sum with a uniform background."""
+    coulomb = FIELD_CONSTANT / (4 * np.pi)
+    axis = np.arange(-nmax, nmax + 1)
+    lattice = np.stack(
+        np.meshgrid(axis, axis, axis, indexing='ij'), -1
+    ).reshape(-1, 3)
+    lattice = lattice[np.any(lattice != 0, axis=1)]
+    distances = jnp.linalg.norm(
+        jnp.asarray(lattice, dtype=jnp.float64) * box, axis=1
+    )
+    real = (
+        0.5
+        * coulomb
+        * charge**2
+        * jnp.sum(erfc(alpha * distances) / distances)
+    )
+
+    k_axis = np.arange(-kmax, kmax + 1)
+    k_int = np.stack(
+        np.meshgrid(k_axis, k_axis, k_axis, indexing='ij'), -1
+    ).reshape(-1, 3)
+    k_int = k_int[np.any(k_int != 0, axis=1)]
+    k_vectors = 2 * np.pi / box * jnp.asarray(k_int, dtype=jnp.float64)
+    k2 = jnp.sum(k_vectors**2, axis=1)
+    reciprocal = (
+        coulomb
+        * 2
+        * np.pi
+        / box**3
+        * charge**2
+        * jnp.sum(jnp.exp(-k2 / (4 * alpha**2)) / k2)
+    )
+    self_energy = -coulomb * alpha / np.sqrt(np.pi) * charge**2
+    background = ewald_neutralizing_background_energy(charge, box**3, alpha)
+    return real + reciprocal + self_energy + background, background
+
+
+def test_charged_ewald_background_restores_alpha_independence():
+    jax.config.update('jax_enable_x64', True)
+    low_alpha, low_background = _single_charge_ewald(0.35)
+    high_alpha, high_background = _single_charge_ewald(0.65)
+    np.testing.assert_allclose(low_alpha, high_alpha, atol=2e-11, rtol=0)
+    # Without the background, the same charged Ewald sum depends on the
+    # arbitrary real/reciprocal splitting parameter.
+    assert abs(
+        float((low_alpha - low_background) - (high_alpha - high_background))
+    ) > 1e-3
+
+
+def test_charged_mixed_fourier_replacement_is_alpha_independent():
+    """Combined-minus-MM Fourier plus restored MM Ewald has one convention."""
+    jax.config.update('jax_enable_x64', True)
+    model = PeriodicPolarElectrostatics(1, 1.5, 1, (1.5, 3.0))
+    box = 9.0
+    qm_positions = jnp.asarray([[2.0, 3.0, 4.0], [2.8, 3.1, 4.0]])
+    qm_density = jnp.asarray([[0.4, 0.1, -0.2, 0.05], [-0.1, 0.03, 0.04, -0.01]])
+    mm_positions = jnp.asarray([[5.0, 4.0, 3.0]])
+    mm_charges = jnp.asarray([0.7])
+    cache = model.precompute(
+        qm_positions,
+        jnp.zeros(2, dtype=jnp.int32),
+        jnp.eye(3)[None] * box,
+    )
+    qm_and_cross, _ = model.mixed_coulomb_energy(
+        qm_density, mm_positions, mm_charges, cache
+    )
+    mm_low, _ = _single_charge_ewald(0.35, charge=0.7, box=box)
+    mm_high, _ = _single_charge_ewald(0.65, charge=0.7, box=box)
+    np.testing.assert_allclose(
+        qm_and_cross[0] + mm_low,
+        qm_and_cross[0] + mm_high,
+        atol=2e-11,
+        rtol=0,
+    )
 
 
 @pytest.mark.parametrize('include_self', [False, True])

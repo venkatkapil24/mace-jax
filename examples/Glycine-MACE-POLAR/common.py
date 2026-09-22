@@ -17,6 +17,8 @@ def model_data(atoms, config):
     species = jnp.asarray([z_to_index[int(z)] for z in numbers], dtype=jnp.int32)
     n = len(atoms)
     box = float(atoms.cell[0, 0])
+    total_charge = float(atoms.info.get('qm_charge', atoms.info.get('charge', 0.0)))
+    total_spin = float(atoms.info.get('qm_spin', atoms.info.get('spin', 1.0)))
     return {
         'positions': jnp.asarray(atoms.positions, dtype=jnp.float64),
         'node_attrs': jax.nn.one_hot(species, len(z_to_index), dtype=jnp.float64),
@@ -29,8 +31,8 @@ def model_data(atoms, config):
         'cell': jnp.eye(3, dtype=jnp.float64)[None] * box,
         'pbc': jnp.asarray([[True, True, True]]),
         'head': jnp.asarray([0], dtype=jnp.int32),
-        'total_charge': jnp.asarray([0.0], dtype=jnp.float64),
-        'total_spin': jnp.asarray([1.0], dtype=jnp.float64),
+        'total_charge': jnp.asarray([total_charge], dtype=jnp.float64),
+        'total_spin': jnp.asarray([total_spin], dtype=jnp.float64),
         'external_field': jnp.zeros((1, 3), dtype=jnp.float64),
     }
 
