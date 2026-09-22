@@ -62,14 +62,15 @@ def generate_velocities(atoms, temperature, seed):
     return velocities * np.sqrt(target / kinetic)
 
 
-def build_energy(atoms, bundle, mode_name, alpha, kmax):
+def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
+                 restraint_radius, restraint_k):
     box = float(atoms.cell[0, 0])
-    n_qm = len(atoms) if mode_name == 'polar' else 10
+    n_qm = len(atoms) if mode_name == 'polar' else 10 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
     box, periodic_mode, data, graphdef, params, neighbor_fn, shift_fn = (
         initialize_model(qm_atoms, bundle)
     )
-    if mode_name == 'mlmm' and (len(atoms) - 10) % 3:
+    if mode_name == 'mlmm' and (len(atoms) - n_qm) % 3:
         raise ValueError('MM region must contain complete water triplets')
     mm_count = (len(atoms) - n_qm) // 3
     mm_charges = jnp.asarray(TIP3P_Q * mm_count, dtype=jnp.float64)
@@ -103,9 +104,17 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax):
         mm_o = waters[:, 0]
         oo = minimum_image(mm_o[mm_o_pairs[0]] - mm_o[mm_o_pairs[1]], box)
         mm_lj = jnp.sum(lj(jnp.linalg.norm(oo, axis=-1), TIP3P_SIGMA, TIP3P_EPS))
-        cross = minimum_image(qm_r[:, None] - mm_o[None], box)
-        cross_r = jnp.linalg.norm(cross, axis=-1)
-        cross_lj = jnp.sum(lj(cross_r, cross_sigma[:, None], cross_epsilon[:, None]))
+        gly_cross = minimum_image(qm_r[:10, None] - mm_o[None], box)
+        gly_cross_r = jnp.linalg.norm(gly_cross, axis=-1)
+        cross_lj = jnp.sum(lj(
+            gly_cross_r, cross_sigma[:, None], cross_epsilon[:, None]
+        ))
+        # QM water O - MM water O uses the same TIP3P Lennard-Jones type.
+        qm_water_o = qm_r[10::3]
+        water_cross = minimum_image(qm_water_o[:, None] - mm_o[None], box)
+        cross_lj += jnp.sum(lj(
+            jnp.linalg.norm(water_cross, axis=-1), TIP3P_SIGMA, TIP3P_EPS
+        ))
 
         delta = minimum_image(mm_r[:, None] - mm_r[None], box)
         distances = jnp.sqrt(jnp.sum(delta*delta, axis=-1) + 1e-24)
@@ -124,6 +133,16 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax):
         )
         return bonded + mm_lj + cross_lj + real + reciprocal + self_energy + exceptions
 
+    def boundary_restraint(qm_r):
+        # Restrain only first-shell water oxygens, with zero energy/force
+        # inside the shell. The closest glycine O/O/N site moves with glycine.
+        delta = minimum_image(
+            qm_r[10::3, None] - qm_r[jnp.asarray([0, 1, 2])][None], box
+        )
+        nearest = jnp.linalg.norm(delta, axis=-1).min(axis=-1)
+        excess = jnp.maximum(nearest - restraint_radius, 0.0)
+        return 0.5 * restraint_k * jnp.sum(excess**2)
+
     def energy_fn(r, neighbors, model_params):
         qm_r = r[:n_qm]
         edge_index, shifts, unit_shifts = graph_edges(qm_r, neighbors, box)
@@ -137,7 +156,8 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax):
         polar_energy = nnx.merge(graphdef, model_params)(
             inputs, compute_force=False, pbc_handling=periodic_mode
         )['energy'][0]
-        return polar_energy if mode_name == 'polar' else polar_energy + mm_terms(r[n_qm:], qm_r)
+        return (polar_energy if mode_name == 'polar' else
+                polar_energy + mm_terms(r[n_qm:], qm_r) + boundary_restraint(qm_r))
 
     return jax.jit(jax.value_and_grad(energy_fn)), params, neighbor_fn, shift_fn, n_qm
 
@@ -197,6 +217,9 @@ def main():
     parser.add_argument('--report-interval', type=int, default=200)
     parser.add_argument('--ewald-alpha', type=float, default=0.5)
     parser.add_argument('--ewald-kmax', type=int, default=6)
+    parser.add_argument('--qm-water-count', type=int, default=0)
+    parser.add_argument('--restraint-radius', type=float, default=4.2)
+    parser.add_argument('--restraint-k', type=float, default=0.2)
     args = parser.parse_args()
     if args.steps % args.chunk or args.chunk % args.save_interval:
         raise ValueError('steps must divide by chunk and chunk by save-interval')
@@ -205,13 +228,19 @@ def main():
     atoms = read(args.initial)
     if len(atoms) != 166:
         raise ValueError('Expected 10 glycine atoms and 52 waters')
+    if args.mode == 'mlmm':
+        if not 1 <= args.qm_water_count < 52:
+            raise ValueError('ML/MM requires a nonempty first-shell QM water region')
+        if int(atoms.info.get('qm_water_count', -1)) != args.qm_water_count:
+            raise ValueError('QM water count differs from initial structure metadata')
     initial_oh = float(np.linalg.norm(atoms.positions[0]-atoms.positions[9]))
     initial_nh = float(np.linalg.norm(atoms.positions[2]-atoms.positions[9]))
     if not initial_oh < initial_nh:
         raise ValueError('Initial glycine is not neutral')
     write(args.output / 'initial.xyz', atoms, format='extxyz')
     force_eval, params, neighbor_fn, shift_fn, n_qm = build_energy(
-        atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax
+        atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,
+        args.qm_water_count, args.restraint_radius, args.restraint_k
     )
     checkpoint = args.output / 'checkpoint.npz'
     if checkpoint.exists():
@@ -275,6 +304,9 @@ def main():
             'elapsed_seconds_this_process': time.perf_counter()-started,
             'last_sample': samples[-1] if samples else None,
             'cpu_only': os.environ.get('JAX_PLATFORMS') == 'cpu',
+            'qm_water_count': args.qm_water_count if args.mode == 'mlmm' else 52,
+            'restraint_radius_angstrom': args.restraint_radius if args.mode == 'mlmm' else None,
+            'restraint_k_eV_per_angstrom2': args.restraint_k if args.mode == 'mlmm' else None,
         }
         (args.output / 'progress.json').write_text(json.dumps(progress, indent=2)+'\n')
         print(json.dumps(progress), flush=True)

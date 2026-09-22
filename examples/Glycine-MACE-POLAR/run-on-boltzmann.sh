@@ -14,6 +14,7 @@ base="$root/Examples/Glycine-MACE-POLAR"
 mm_base="$root/Examples/Glycine-MLMM"
 initial="$base/structure/initial-neutral.xyz"
 optimized="$base/bfgs/optimized-neutral.xyz"
+md_initial="$base/structure/md-initial.xyz"
 bundle="$root/artifacts/MACE-POLAR-1-M-jax-fixed.msgpack"
 mkdir -p "$base/bfgs" "$base/md-100ps" "$mm_base/md-100ps"
 
@@ -24,16 +25,22 @@ if [[ ! -s "$optimized" ]]; then
     --fmax 0.1 --max-steps 500 > "$base/bfgs/run.log" 2>&1
 fi
 
-echo "Starting both CPU trajectories from $optimized"
+python examples/Glycine-MACE-POLAR/prepare_md_start.py \
+  --optimized "$optimized" --output "$md_initial" \
+  > "$base/structure/partition.log" 2>&1
+qm_water_count=$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["qm_water_count"])' "$base/structure/partition.json")
+echo "Starting both CPU trajectories from $md_initial; $qm_water_count first-shell QM waters"
 taskset -c 0-7 python examples/Glycine-MACE-POLAR/md.py \
-  --mode polar --initial "$optimized" --bundle "$bundle" \
+  --mode polar --initial "$md_initial" --bundle "$bundle" \
   --output "$base/md-100ps" --steps 200000 --timestep-fs 0.5 \
   --temperature-k 330 --seed 20260922 \
   > "$base/md-100ps/run.log" 2>&1 &
 polar_pid=$!
 
 taskset -c 8-15 python examples/Glycine-MACE-POLAR/md.py \
-  --mode mlmm --initial "$optimized" --bundle "$bundle" \
+  --mode mlmm --initial "$md_initial" --bundle "$bundle" \
+  --qm-water-count "$qm_water_count" \
+  --restraint-radius 4.2 --restraint-k 0.2 \
   --output "$mm_base/md-100ps" --steps 200000 --timestep-fs 0.5 \
   --temperature-k 330 --seed 20260922 \
   > "$mm_base/md-100ps/run.log" 2>&1 &
