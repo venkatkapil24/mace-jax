@@ -19,10 +19,19 @@ bundle="$root/artifacts/MACE-POLAR-1-M-jax-fixed.msgpack"
 mkdir -p "$base/bfgs" "$base/md-100ps" "$mm_base/md-100ps"
 
 if [[ ! -s "$optimized" ]]; then
-  echo "Starting constrained neutral glycine BFGS on CPU"
-  taskset -c 0-7 python examples/Glycine-MACE-POLAR/optimize.py \
-    --initial "$initial" --bundle "$bundle" --output "$base/bfgs" \
-    --fmax 0.1 --max-steps 500 > "$base/bfgs/run.log" 2>&1
+  if [[ -s "$base/bfgs/existing-optimizer.pid" ]]; then
+    optimizer_pid=$(cat "$base/bfgs/existing-optimizer.pid")
+    echo "Waiting for existing CPU BFGS pid=$optimizer_pid"
+    while [[ -n $(ps -p "$optimizer_pid" -o stat= 2>/dev/null | grep -v '^Z' || true) ]]; do
+      sleep 30
+    done
+    [[ -s "$optimized" ]] || { echo "Existing BFGS did not converge"; exit 1; }
+  else
+    echo "Starting constrained neutral glycine BFGS on CPU"
+    taskset -c 0-7 python examples/Glycine-MACE-POLAR/optimize.py \
+      --initial "$initial" --bundle "$bundle" --output "$base/bfgs" \
+      --fmax 0.1 --max-steps 500 > "$base/bfgs/run.log" 2>&1
+  fi
 fi
 
 python examples/Glycine-MACE-POLAR/prepare_md_start.py \
