@@ -376,6 +376,82 @@ class PeriodicPolarElectrostatics:
         potential = density * coulomb_factor[:, None] * FIELD_CONSTANT
         return density, potential
 
+    @staticmethod
+    def point_charge_density(
+        positions: jnp.ndarray,
+        charges: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Fourier density of MM point charges on the POLAR reciprocal grid."""
+        phase = cache['k_vectors'] @ positions.T
+        density = jnp.stack(
+            (jnp.cos(phase) @ charges, -(jnp.sin(phase) @ charges)), axis=-1
+        )
+        return (2 * math.pi) ** 3 * density / cache['volume_per_k'][:, None]
+
+    def point_charge_field_features(
+        self,
+        positions: jnp.ndarray,
+        charges: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Project an MM point-charge potential onto the QM GTO receivers."""
+        density = self.point_charge_density(positions, charges, cache)
+        k0 = cache['k0_mask'] > 0
+        inverse_k2 = jnp.where(k0, 0.0, 1.0 / jnp.where(k0, 1.0, cache['k_norm2']))
+        potential = density * inverse_k2[:, None] * FIELD_CONSTANT
+        basis = cache['feature_basis']
+        basis_real = basis[..., 0].reshape(basis.shape[0], -1)
+        basis_imag = basis[..., 1].reshape(basis.shape[0], -1)
+        a = potential[:, :1] * basis_real + potential[:, 1:] * basis_imag
+        b = potential[:, :1] * basis_imag - potential[:, 1:] * basis_real
+        factor = jnp.where(k0, 0.5, 1.0)
+        projected = (
+            2
+            * (
+                (a * factor[:, None]).T @ cache['cosines']
+                + (b * factor[:, None]).T @ cache['sines']
+            ).T
+            / (2 * math.pi) ** 3
+        )
+        return projected[:, self.output_permutation]
+
+    def mixed_coulomb_energy(
+        self,
+        source_feats: jnp.ndarray,
+        mm_positions: jnp.ndarray,
+        mm_charges: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """QM self plus QM/MM cross from one combined Fourier density.
+
+        The point-charge MM/MM Fourier term is removed here. A conventional
+        point-charge Ewald solver supplies it with its own self and exclusion
+        corrections; the MM density still contributes to the shared potential.
+        This proof of concept handles one periodic graph.
+        """
+        qm_density, _ = self._density_and_potential(source_feats, cache)
+        mm_density = self.point_charge_density(mm_positions, mm_charges, cache)
+        combined_density = qm_density + mm_density
+        k0 = cache['k0_mask'] > 0
+        inverse_k2 = jnp.where(k0, 0.0, 1.0 / jnp.where(k0, 1.0, cache['k_norm2']))
+        prefactor = cache['volume'][0] * FIELD_CONSTANT / (2 * math.pi) ** 6
+        combined = prefactor * jnp.sum(
+            jnp.sum(combined_density**2, axis=-1) * inverse_k2
+        )
+        mm_only = prefactor * jnp.sum(jnp.sum(mm_density**2, axis=-1) * inverse_k2)
+        qm_only = prefactor * jnp.sum(jnp.sum(qm_density**2, axis=-1) * inverse_k2)
+        qm_and_cross = combined - mm_only
+        if not self.include_energy_self_interaction:
+            self_terms = (
+                _gather_self_terms(source_feats, self.energy_self_index_tuple)
+                * self.energy_self_values
+            )
+            qm_and_cross = qm_and_cross - 0.5 * jnp.sum(
+                source_feats[:, : self_terms.shape[-1]] * self_terms
+            )
+        return jnp.asarray([qm_and_cross]), jnp.asarray([combined - mm_only - qm_only])
+
     def field_features(
         self,
         source_feats: jnp.ndarray,

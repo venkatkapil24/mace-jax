@@ -171,6 +171,32 @@ compile as different input shapes; no reciprocal-vector padding is used. Add
 `--jit` to `scripts/verify_polar_backbone.py` to compare a compiled run against
 Torch for any supported electrostatics mode.
 
+### Periodic two-water QM/MM proof of concept
+
+`scripts/qmmm_two_water.py` places one water in the POLAR QM region and one
+AMBER14 TIP3P water in a 10 Å periodic cube. The QM graph contains only its
+three atoms. MM point charges contribute to each POLAR charge-density update.
+The final periodic reciprocal calculation uses the combined QM multipole and
+MM point-charge density. Its MM-only Fourier part is replaced by a point-charge
+Ewald energy with the water's intramolecular charge pairs excluded. The script
+adds TIP3P bond and angle terms and a provisional oxygen--oxygen Lennard-Jones
+term across the boundary, then differentiates the complete energy with respect
+to all six positions.
+
+```sh
+PYTHONPATH=. /Users/venkatkapil24/scratch/codex/jax/.venv/bin/python \
+  scripts/qmmm_two_water.py --bundle /tmp/MACE-POLAR-1-M-jax-fixed.msgpack
+```
+
+The TIP3P parameters come from
+[OpenMM's AMBER14 TIP3P file](https://github.com/openmm/openmm/blob/master/wrappers/python/openmm/app/data/amber14/tip3p.xml).
+This small proof of concept implements the fixed water topology directly in JAX;
+it does not load a JAX-MD AMBER system. The QM/MM cross term uses POLAR's finite
+Fourier cutoff, so its accuracy near the boundary and the provisional LJ choice
+need validation before using this for simulations. The MM Ewald implementation
+is specialized to one neutral water in this box and omits real-space image terms
+that are negligible for the chosen Ewald settings.
+
 ### Small static evaluation panel
 
 For a laptop-sized check across boundary conditions, the verifier also accepts

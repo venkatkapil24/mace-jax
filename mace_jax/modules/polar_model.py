@@ -265,8 +265,26 @@ class PolarMACE(ScaleShiftMACE):
                 data.get('reference_cell'),
                 coefficients=coefficients,
             )
+        mm_positions = data.get('mm_positions')
+        mm_charges = data.get('mm_charges')
+        if (mm_positions is None) != (mm_charges is None):
+            raise ValueError('MM positions and charges must be provided together')
+        if mm_positions is not None and not periodic:
+            raise ValueError('MM embedding requires periodic electrostatics')
+        if mm_positions is not None and mode != 'pbc':
+            raise ValueError('MM embedding currently supports bulk pbc mode only')
         node_attrs = data['node_attrs']
         num_graphs = int(data['ptr'].shape[0] - 1)
+        if mm_positions is not None and num_graphs != 1:
+            raise ValueError('MM embedding currently supports one graph')
+        half_mm_field = (
+            0.5
+            * self.periodic_electrostatics.point_charge_field_features(
+                mm_positions, mm_charges, periodic_cache
+            )
+            if mm_positions is not None
+            else 0.0
+        )
         node_feats_list = jnp.split(
             backbone['node_feats'], self.num_interactions, axis=-1
         )
@@ -360,8 +378,8 @@ class PolarMACE(ScaleShiftMACE):
                     mode=periodic_mode,
                     pbc=pbc,
                 )
-            alpha = (alpha + half_external) / self.field_feature_norms
-            beta = (beta + half_external) / self.field_feature_norms
+            alpha = (alpha + half_external + half_mm_field) / self.field_feature_norms
+            beta = (beta + half_external + half_mm_field) / self.field_feature_norms
             potential_features = jnp.concatenate((alpha, beta), axis=-1)
             field_steps.append(potential_features)
             output = update(
@@ -404,9 +422,16 @@ class PolarMACE(ScaleShiftMACE):
                 dim=0,
                 dim_size=num_graphs,
             )
+        cross_electrostatic_energy = jnp.zeros((num_graphs,), dtype=positions.dtype)
         if periodic_cache is None:
             electrostatic_energy = self.electrostatics.coulomb_energy(
                 density, positions, batch, num_graphs
+            )
+        elif mm_positions is not None:
+            electrostatic_energy, cross_electrostatic_energy = (
+                self.periodic_electrostatics.mixed_coulomb_energy(
+                    density, mm_positions, mm_charges, periodic_cache
+                )
             )
         else:
             electrostatic_energy = self.periodic_electrostatics.coulomb_energy(
@@ -426,6 +451,7 @@ class PolarMACE(ScaleShiftMACE):
             'energy': total_energy,
             'electron_energy': electron_energy,
             'electrostatic_energy': electrostatic_energy,
+            'cross_electrostatic_energy': cross_electrostatic_energy,
             'density_coefficients': density,
             'spin_density': spin_density,
             'spin_charge_density': spin_charge_density,
