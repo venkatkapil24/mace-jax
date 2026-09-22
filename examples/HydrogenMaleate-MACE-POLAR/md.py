@@ -62,7 +62,7 @@ def generate_velocities(atoms, temperature, seed):
 
 
 def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
-                 restraint_radius, restraint_k):
+                 first_shell_water_count, restraint_radius, restraint_k):
     box = float(atoms.cell[0, 0])
     n_qm = len(atoms) if mode_name == 'polar' else 11 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
@@ -139,14 +139,25 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         )
 
     def boundary_restraint(qm_r):
-        # Restrain only first-shell water oxygens, with zero energy/force
-        # inside the shell. The closest solute oxygen moves with the solute.
-        delta = minimum_image(
-            qm_r[11::3, None] - qm_r[jnp.asarray([0, 1, 2, 3])][None], box
+        # Each flat-bottom restraint acts only when a QM water leaves the
+        # geometric shell to which its fixed ML/MM identity belongs.
+        water_o = qm_r[11::3]
+        first_o = water_o[:first_shell_water_count]
+        first_delta = minimum_image(
+            first_o[:, None] - qm_r[jnp.asarray([0, 1, 2, 3])][None], box
         )
-        nearest = jnp.linalg.norm(delta, axis=-1).min(axis=-1)
-        excess = jnp.maximum(nearest - restraint_radius, 0.0)
-        return 0.5 * restraint_k * jnp.sum(excess**2)
+        first_distance = jnp.linalg.norm(first_delta, axis=-1).min(axis=-1)
+        first_excess = jnp.maximum(first_distance - restraint_radius, 0.0)
+        energy = 0.5 * restraint_k * jnp.sum(first_excess**2)
+        if first_shell_water_count < qm_water_count:
+            second_o = water_o[first_shell_water_count:]
+            second_delta = minimum_image(
+                second_o[:, None] - first_o[None], box
+            )
+            second_distance = jnp.linalg.norm(second_delta, axis=-1).min(axis=-1)
+            second_excess = jnp.maximum(second_distance - restraint_radius, 0.0)
+            energy = energy + 0.5 * restraint_k * jnp.sum(second_excess**2)
+        return energy
 
     def energy_fn(r, neighbors, model_params):
         qm_r = r[:n_qm]
@@ -225,6 +236,8 @@ def main():
     parser.add_argument('--ewald-alpha', type=float, default=0.5)
     parser.add_argument('--ewald-kmax', type=int, default=6)
     parser.add_argument('--qm-water-count', type=int, default=0)
+    parser.add_argument('--first-shell-water-count', type=int)
+    parser.add_argument('--initial-velocities', type=Path)
     parser.add_argument('--restraint-radius', type=float, default=4.2)
     parser.add_argument('--restraint-k', type=float, default=0.2)
     args = parser.parse_args()
@@ -240,6 +253,14 @@ def main():
             raise ValueError('ML/MM requires a nonempty first-shell QM water region')
         if int(atoms.info.get('qm_water_count', -1)) != args.qm_water_count:
             raise ValueError('QM water count differs from initial structure metadata')
+        if args.first_shell_water_count is None:
+            args.first_shell_water_count = args.qm_water_count
+        if not 1 <= args.first_shell_water_count <= args.qm_water_count:
+            raise ValueError('Invalid first-shell water count')
+        if int(atoms.info.get('first_shell_water_count', args.first_shell_water_count)) != args.first_shell_water_count:
+            raise ValueError('First-shell water count differs from initial structure metadata')
+    else:
+        args.first_shell_water_count = 0
     initial_h_to_o = np.linalg.norm(atoms.positions[:4]-atoms.positions[10], axis=1)
     if not initial_h_to_o[:2].min() < initial_h_to_o[2:].min():
         raise ValueError('Initial hydrogen maleate proton is not on the left carboxyl')
@@ -248,7 +269,8 @@ def main():
     write(args.output / 'initial.xyz', atoms, format='extxyz')
     force_eval, params, neighbor_fn, shift_fn, n_qm = build_energy(
         atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,
-        args.qm_water_count, args.restraint_radius, args.restraint_k
+        args.qm_water_count, args.first_shell_water_count,
+        args.restraint_radius, args.restraint_k
     )
     checkpoint = args.output / 'checkpoint.npz'
     if checkpoint.exists():
@@ -260,7 +282,19 @@ def main():
     else:
         start_step = 0
         positions = jnp.asarray(atoms.positions, dtype=jnp.float64)
-        velocities = jnp.asarray(generate_velocities(atoms, args.temperature_k, args.seed))
+        if args.initial_velocities is None:
+            initial_velocities = generate_velocities(atoms, args.temperature_k, args.seed)
+        else:
+            initial_velocities = np.load(args.initial_velocities)
+            if initial_velocities.shape != (len(atoms), 3) or not np.all(np.isfinite(initial_velocities)):
+                raise ValueError('Initial velocities must be a finite (n_atoms, 3) array')
+        velocities = jnp.asarray(initial_velocities, dtype=jnp.float64)
+    noise_order = jnp.asarray(
+        atoms.arrays.get('source_atom_index', np.arange(len(atoms))),
+        dtype=jnp.int32,
+    )
+    if sorted(np.asarray(noise_order).tolist()) != list(range(len(atoms))):
+        raise ValueError('source_atom_index must be a permutation of atom indices')
     masses = jnp.asarray(atoms.get_masses()[:, None], dtype=jnp.float64)
     neighbors = neighbor_fn.allocate(positions[:n_qm])
     compile_start = time.perf_counter()
@@ -275,7 +309,9 @@ def main():
         r, v, nbrs, energy, grad = carry
         v = v - 0.5*dt*grad/masses
         r = shift_fn(r, 0.5*dt*v)
-        noise = jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(args.seed+1), absolute_step), r.shape)
+        noise = jax.random.normal(
+            jax.random.fold_in(jax.random.PRNGKey(args.seed+1), absolute_step), r.shape
+        )[noise_order]
         v = c*v + noise_scale*noise
         r = shift_fn(r, 0.5*dt*v)
         nbrs = neighbor_fn.update(r[:n_qm], nbrs)
@@ -313,6 +349,8 @@ def main():
             'last_sample': samples[-1] if samples else None,
             'cpu_only': os.environ.get('JAX_PLATFORMS') == 'cpu',
             'qm_water_count': args.qm_water_count if args.mode == 'mlmm' else 52,
+            'first_shell_water_count': args.first_shell_water_count if args.mode == 'mlmm' else None,
+            'second_shell_water_count': args.qm_water_count - args.first_shell_water_count if args.mode == 'mlmm' else None,
             'restraint_radius_angstrom': args.restraint_radius if args.mode == 'mlmm' else None,
             'restraint_k_eV_per_angstrom2': args.restraint_k if args.mode == 'mlmm' else None,
         }
