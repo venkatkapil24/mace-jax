@@ -38,11 +38,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--examples', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--include-second-shell', action='store_true')
     args = parser.parse_args()
     names = {
         'Full MACE-POLAR': 'HydrogenMaleate-MACE-POLAR',
         'First-shell ML/MM': 'HydrogenMaleate-MLMM',
     }
+    if args.include_second_shell:
+        names['Second-shell ML/MM'] = 'HydrogenMaleate-MLMM-SecondShell'
     data = {
         label: samples(args.examples / folder / 'md-100ps')
         for label, folder in names.items()
@@ -65,6 +68,7 @@ def main() -> None:
     colors = {
         'Full MACE-POLAR': '#254b8d',
         'First-shell ML/MM': '#d06a29',
+        'Second-shell ML/MM': '#329778',
     }
     fig, axes = plt.subplots(2, 1, figsize=(8.5, 7), sharex=True, sharey=True)
     for axis, subset, title in (
