@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render matched hydrogen-maleate MP4s (requires imageio-ffmpeg)."""
+"""Render a top-view side-by-side hydrogen-maleate MP4 (requires imageio-ffmpeg)."""
 
 from __future__ import annotations
 
@@ -75,6 +75,27 @@ def centered_positions(raw: np.ndarray, box: float) -> np.ndarray:
     return result
 
 
+def top_view_reference(initial: Path, box: float) -> np.ndarray:
+    heavy = centered_positions(np.asarray(read(initial).positions), box)[:8]
+    x_axis = heavy[2:4].mean(axis=0) - heavy[:2].mean(axis=0)
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = heavy[0] - heavy[1]
+    y_axis -= np.dot(y_axis, x_axis) * x_axis
+    y_axis /= np.linalg.norm(y_axis)
+    z_axis = np.cross(x_axis, y_axis)
+    basis = np.column_stack((x_axis, y_axis, z_axis))
+    return heavy @ basis
+
+
+def align_top_view(positions: np.ndarray, reference_heavy: np.ndarray) -> np.ndarray:
+    moving = positions[:8] - positions[:8].mean(axis=0)
+    target = reference_heavy - reference_heavy.mean(axis=0)
+    u, _, vt = np.linalg.svd(moving.T @ target)
+    reflection = np.eye(3)
+    reflection[2, 2] = np.linalg.det(u @ vt)
+    return positions @ (u @ reflection @ vt)
+
+
 def solute_bonds(initial: Path, box: float) -> list[tuple[int, int]]:
     atoms = read(initial)
     positions = np.asarray(atoms.positions)
@@ -89,20 +110,21 @@ def solute_bonds(initial: Path, box: float) -> list[tuple[int, int]]:
     return pairs
 
 
-def draw_halo(ax, positions: np.ndarray, box: float) -> None:
+def draw_halo(ax, positions: np.ndarray, unrotated: np.ndarray, box: float) -> None:
     # Orthographic projection of the 3D zero-force region. Actual restraint
     # forces below are based on the full 3D minimum-image O–O distance.
     grid = np.linspace(-box / 2, box / 2, 140)
     x, y = np.meshgrid(grid, grid)
     distance = np.full_like(x, np.inf)
     for oxygen in positions[:4]:
-        dx = minimum_image(x - oxygen[0], box)
-        dy = minimum_image(y - oxygen[1], box)
+        dx = x - oxygen[0]
+        dy = y - oxygen[1]
         distance = np.minimum(distance, np.hypot(dx, dy))
     ax.contourf(x, y, distance, levels=[0, 4.2], colors=['#ffe056'], alpha=0.14)
     ax.contour(x, y, distance, levels=[4.2], colors=['#eab800'], linewidths=1.4)
     first_shell_o = positions[SOLUTE_ATOMS:SOLUTE_ATOMS + 3 * QM_WATERS:3]
-    delta = minimum_image(first_shell_o[:, None] - positions[None, :4], box)
+    original_o = unrotated[SOLUTE_ATOMS:SOLUTE_ATOMS + 3 * QM_WATERS:3]
+    delta = minimum_image(original_o[:, None] - unrotated[None, :4], box)
     distance_3d = np.linalg.norm(delta, axis=-1).min(axis=-1)
     active = first_shell_o[distance_3d > 4.2]
     if len(active):
@@ -112,11 +134,13 @@ def draw_halo(ax, positions: np.ndarray, box: float) -> None:
 
 def draw_panel(
     ax, raw: np.ndarray, box: float, bonds: list[tuple[int, int]],
+    reference_heavy: np.ndarray,
     *, mlmm: bool, time_ps: float,
 ) -> None:
     ax.clear()
     ax.set_facecolor('white')
-    xyz = centered_positions(raw, box)
+    unrotated = centered_positions(raw, box)
+    xyz = align_top_view(unrotated, reference_heavy)
     ax.set_xlim(-box / 2, box / 2)
     ax.set_ylim(-box / 2, box / 2)
     ax.set_aspect('equal')
@@ -127,7 +151,7 @@ def draw_panel(
         spine.set_linewidth(1)
 
     if mlmm:
-        draw_halo(ax, xyz, box)
+        draw_halo(ax, xyz, unrotated, box)
 
     water_o = xyz[SOLUTE_ATOMS::3]
     water_segments = [
@@ -199,6 +223,7 @@ def main() -> None:
     initial = args.examples / 'HydrogenMaleate-MACE-POLAR/structure/md-initial.xyz'
     box = float(read(initial).cell[0, 0])
     bonds = solute_bonds(initial, box)
+    reference_heavy = top_view_reference(initial, box)
     polar = load_frames(args.examples / 'HydrogenMaleate-MACE-POLAR/md-100ps', set(times))
     mlmm = load_frames(args.examples / 'HydrogenMaleate-MLMM/md-100ps', set(times))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -206,9 +231,11 @@ def main() -> None:
     figure.subplots_adjust(left=0.035, right=0.985, bottom=0.045, top=0.91, wspace=0.06)
 
     def render(time_fs: int) -> np.ndarray:
-        draw_panel(axes[0], polar[time_fs], box, bonds, mlmm=False,
+        draw_panel(axes[0], polar[time_fs], box, bonds, reference_heavy,
+                   mlmm=False,
                    time_ps=time_fs / 1000)
-        draw_panel(axes[1], mlmm[time_fs], box, bonds, mlmm=True,
+        draw_panel(axes[1], mlmm[time_fs], box, bonds, reference_heavy,
+                   mlmm=True,
                    time_ps=time_fs / 1000)
         figure.canvas.draw()
         return np.asarray(figure.canvas.buffer_rgba())[:, :, :3].copy()
@@ -217,27 +244,16 @@ def main() -> None:
         imageio.imwrite(args.output / 'preview.png', render(times[0]))
         return
 
-    plain_path = args.output / 'full-mace-polar.mp4'
-    halo_path = args.output / 'first-shell-mlmm-halo.mp4'
     pair_path = args.output / 'side-by-side.mp4'
-    with (
-        imageio.get_writer(plain_path, fps=args.fps, codec='libx264', quality=8,
-                           macro_block_size=8) as plain,
-        imageio.get_writer(halo_path, fps=args.fps, codec='libx264', quality=8,
-                           macro_block_size=8) as halo,
-        imageio.get_writer(pair_path, fps=args.fps, codec='libx264', quality=8,
-                           macro_block_size=8) as pair,
-    ):
+    with imageio.get_writer(pair_path, fps=args.fps, codec='libx264', quality=8,
+                            macro_block_size=8) as pair:
         for i, time_fs in enumerate(times, 1):
             frame = render(time_fs)
-            middle = frame.shape[1] // 2
-            plain.append_data(frame[:, :middle])
-            halo.append_data(frame[:, middle:])
             pair.append_data(frame)
             if i % 20 == 0 or i == len(times):
                 print(f'Rendered {i}/{len(times)} frames ({time_fs / 1000:.2f} ps)', flush=True)
     plt.close(figure)
-    print(f'Wrote {plain_path}, {halo_path}, and {pair_path}', flush=True)
+    print(f'Wrote {pair_path}', flush=True)
 
 
 if __name__ == '__main__':
