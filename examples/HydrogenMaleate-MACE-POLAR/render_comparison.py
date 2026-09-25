@@ -7,7 +7,6 @@ import argparse
 import re
 from pathlib import Path
 
-import imageio.v2 as imageio
 import matplotlib
 
 matplotlib.use('Agg')
@@ -210,6 +209,8 @@ def draw_panel(
 
 
 def main() -> None:
+    import imageio.v2 as imageio
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--examples', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)

@@ -66,11 +66,24 @@ def draw_molecule(ax, initial: Path) -> None:
     ax.set_title('(a) Proton coordinate', loc='left', fontsize=14, weight='bold', pad=12)
 
 
-def draw_free_energy(ax, samples: dict[str, np.ndarray]) -> dict:
+def draw_free_energy(
+    ax, samples: dict[str, np.ndarray], analysis_window: str = 'matched'
+) -> dict:
     common_end = min(array[-1, 0] for array in samples.values())
-    summary = {'matched_time_ps': common_end, 'runs': {}}
+    available_end = {label: float(array[-1, 0]) for label, array in samples.items()}
+    summary = {
+        'analysis_window': analysis_window,
+        'matched_time_ps': common_end,
+        'available_time_ps': available_end,
+        'runs': {},
+    }
     for number, (label, array) in enumerate(samples.items()):
-        q = array[array[:, 0] <= common_end + 1e-9, 1]
+        if analysis_window == 'matched':
+            q = array[array[:, 0] <= common_end + 1e-9, 1]
+            analyzed_time = common_end
+        else:
+            q = array[:, 1]
+            analyzed_time = array[-1, 0]
         profile, barrier = free_energy(q, 0.075)
         profiles, barriers = bootstrap(q, 0.075, 100, 400,
                                        np.random.default_rng(20260923 + number))
@@ -78,7 +91,8 @@ def draw_free_energy(ax, samples: dict[str, np.ndarray]) -> dict:
         ax.plot(CENTERS, profile, color=COLORS[label], linewidth=2.3, label=label)
         ax.fill_between(CENTERS, lower, upper, color=COLORS[label], alpha=0.18)
         summary['runs'][label] = {
-            'frames': len(q), 'barrier_kBT': barrier,
+            'frames': len(q), 'analyzed_time_ps': float(analyzed_time),
+            'barrier_kBT': barrier,
             'barrier_95_percent_kBT': np.percentile(barriers, (2.5, 97.5)).tolist(),
         }
     ax.set_xlim(-0.82, 0.82)
@@ -88,8 +102,16 @@ def draw_free_energy(ax, samples: dict[str, np.ndarray]) -> dict:
     ax.set_ylabel(r'$\beta[F(\delta)-F_{\min}]$', fontsize=13)
     ax.set_title('(b) Symmetrized free energy', loc='left', fontsize=14,
                  weight='bold', pad=12)
+    interval_text = (
+        f'matched {common_end:.1f} ps'
+        if analysis_window == 'matched'
+        else (
+            f'available: POLAR {available_end["Full MACE-POLAR"]:.1f} ps, '
+            f'ML/MM {available_end["First-shell ML/MM"]:.1f} ps'
+        )
+    )
     ax.text(0.03, 0.94,
-            rf'$\beta=(k_{{\mathrm{{B}}}}T)^{{-1}}$, $T=330$ K · matched {common_end:.1f} ps',
+            rf'$\beta=(k_{{\mathrm{{B}}}}T)^{{-1}}$, $T=330$ K · {interval_text}',
             transform=ax.transAxes, va='top', fontsize=9.5, color='#4d555b')
     ax.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 0.83),
               fontsize=9.5)
@@ -165,6 +187,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--examples', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--free-energy-window', choices=('matched', 'all'),
+                        default='matched')
     args = parser.parse_args()
     samples = {
         label: read_samples(args.examples / folder / 'md-100ps')
@@ -176,7 +200,7 @@ def main() -> None:
                               wspace=0.32)
     axes = [figure.add_subplot(grid[0, i]) for i in range(3)]
     draw_molecule(axes[0], args.examples / 'HydrogenMaleate-MACE-POLAR/structure/md-initial.xyz')
-    energy = draw_free_energy(axes[1], samples)
+    energy = draw_free_energy(axes[1], samples, args.free_energy_window)
     throughput = draw_throughput(axes[2], args.examples)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(args.output, dpi=180, facecolor='white')
