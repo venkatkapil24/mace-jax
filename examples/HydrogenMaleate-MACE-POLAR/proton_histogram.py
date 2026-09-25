@@ -41,7 +41,8 @@ def main() -> None:
     args = parser.parse_args()
     names = {
         'Full MACE-POLAR': 'HydrogenMaleate-MACE-POLAR',
-        'First-shell ML/MM': 'HydrogenMaleate-MLMM',
+        'Electrostatic embedding': 'HydrogenMaleate-MLMM',
+        'Mechanical embedding': 'HydrogenMaleate-Mechanical',
     }
     data = {
         label: samples(args.examples / folder / 'md-100ps')
@@ -64,7 +65,8 @@ def main() -> None:
     )
     colors = {
         'Full MACE-POLAR': '#254b8d',
-        'First-shell ML/MM': '#d06a29',
+        'Electrostatic embedding': '#d06a29',
+        'Mechanical embedding': '#36845b',
     }
     fig, axes = plt.subplots(2, 1, figsize=(8.5, 7), sharex=True, sharey=True)
     for axis, subset, title in (

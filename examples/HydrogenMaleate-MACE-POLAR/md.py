@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Restartable 330 K periodic hydrogen maleate MD: all POLAR or POLAR/TIP3P."""
+"""Restartable 330 K hydrogen maleate MD with full or embedded MACE-POLAR."""
 
 from __future__ import annotations
 
@@ -62,14 +62,14 @@ def generate_velocities(atoms, temperature, seed):
 
 
 def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
-                 restraint_radius, restraint_k):
+                 restraint_radius, restraint_k, mechanical_qm_charges=None):
     box = float(atoms.cell[0, 0])
     n_qm = len(atoms) if mode_name == 'polar' else 11 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
     box, periodic_mode, data, graphdef, params, neighbor_fn, shift_fn = (
         initialize_model(qm_atoms, bundle)
     )
-    if mode_name == 'mlmm' and (len(atoms) - n_qm) % 3:
+    if mode_name != 'polar' and (len(atoms) - n_qm) % 3:
         raise ValueError('MM region must contain complete water triplets')
     mm_count = (len(atoms) - n_qm) // 3
     mm_charges = jnp.asarray(TIP3P_Q * mm_count, dtype=jnp.float64)
@@ -84,6 +84,20 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
     k_vectors = jnp.asarray(2 * math.pi / box * k_int, dtype=jnp.float64)
     k2 = jnp.sum(k_vectors**2, axis=1)
     k_weights = jnp.exp(-k2 / (4 * alpha**2)) / k2
+    if mode_name == 'mechanical':
+        if mechanical_qm_charges is None:
+            raise ValueError('Mechanical embedding requires fixed QM charges')
+        charge_array = np.asarray(mechanical_qm_charges, dtype=float)
+        if charge_array.shape != (n_qm,):
+            raise ValueError(
+                f'Expected {n_qm} mechanical QM charges, got '
+                f'{charge_array.shape}'
+            )
+        if not np.all(np.isfinite(charge_array)) or not np.isclose(
+            charge_array.sum(), -1.0, atol=1e-10
+        ):
+            raise ValueError('Mechanical QM charges must be finite and sum to -1')
+        mechanical_qm_charges = jnp.asarray(charge_array, dtype=jnp.float64)
     cross_sigma = jnp.asarray((SOLUTE_SIGMA + TIP3P_SIGMA) / 2)
     cross_epsilon = jnp.asarray(np.sqrt(SOLUTE_EPS * TIP3P_EPS))
 
@@ -138,6 +152,35 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
             + background + exceptions
         )
 
+    def mechanical_cross_electrostatics(qm_r, mm_r):
+        """Fixed-charge QM--MM Ewald cross term used by mechanical embedding."""
+        delta = minimum_image(qm_r[:, None] - mm_r[None], box)
+        distances = jnp.linalg.norm(delta, axis=-1)
+        real = COULOMB * jnp.sum(
+            mechanical_qm_charges[:, None]
+            * mm_charges[None]
+            * erfc(alpha * distances)
+            / distances
+        )
+        qm_phase = k_vectors @ qm_r.T
+        mm_phase = k_vectors @ mm_r.T
+        qm_c = jnp.cos(qm_phase) @ mechanical_qm_charges
+        qm_s = jnp.sin(qm_phase) @ mechanical_qm_charges
+        mm_c = jnp.cos(mm_phase) @ mm_charges
+        mm_s = jnp.sin(mm_phase) @ mm_charges
+        reciprocal = (
+            COULOMB * 4 * math.pi / box**3
+            * jnp.sum(k_weights * (qm_c * mm_c + qm_s * mm_s))
+        )
+        q_qm = jnp.sum(mechanical_qm_charges)
+        q_mm = jnp.sum(mm_charges)
+        background = (
+            ewald_neutralizing_background_energy(q_qm + q_mm, box**3, alpha)
+            - ewald_neutralizing_background_energy(q_qm, box**3, alpha)
+            - ewald_neutralizing_background_energy(q_mm, box**3, alpha)
+        )
+        return real + reciprocal + background
+
     def boundary_restraint(qm_r):
         # Restrain only first-shell water oxygens, with zero energy/force
         # inside the shell. The closest solute oxygen moves with the solute.
@@ -161,8 +204,12 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         polar_energy = nnx.merge(graphdef, model_params)(
             inputs, compute_force=False, pbc_handling=periodic_mode
         )['energy'][0]
-        return (polar_energy if mode_name == 'polar' else
-                polar_energy + mm_terms(r[n_qm:], qm_r) + boundary_restraint(qm_r))
+        if mode_name == 'polar':
+            return polar_energy
+        energy = polar_energy + mm_terms(r[n_qm:], qm_r) + boundary_restraint(qm_r)
+        if mode_name == 'mechanical':
+            energy += mechanical_cross_electrostatics(qm_r, r[n_qm:])
+        return energy
 
     return jax.jit(jax.value_and_grad(energy_fn)), params, neighbor_fn, shift_fn, n_qm
 
@@ -210,7 +257,7 @@ def write_chunk(args, atoms, position_series, energy_series, kinetic_series, sta
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--mode', choices=['polar', 'mlmm'], required=True)
+    parser.add_argument('--mode', choices=['polar', 'mlmm', 'mechanical'], required=True)
     parser.add_argument('--initial', type=Path, required=True)
     parser.add_argument('--bundle', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
@@ -227,6 +274,7 @@ def main():
     parser.add_argument('--qm-water-count', type=int, default=0)
     parser.add_argument('--restraint-radius', type=float, default=4.2)
     parser.add_argument('--restraint-k', type=float, default=0.2)
+    parser.add_argument('--mechanical-qm-charges', type=Path)
     args = parser.parse_args()
     if args.steps % args.chunk or args.chunk % args.save_interval:
         raise ValueError('steps must divide by chunk and chunk by save-interval')
@@ -235,11 +283,20 @@ def main():
     atoms = read(args.initial)
     if len(atoms) != 167:
         raise ValueError('Expected 11 hydrogen maleate atoms and 52 waters')
-    if args.mode == 'mlmm':
+    if args.mode != 'polar':
         if not 1 <= args.qm_water_count < 52:
-            raise ValueError('ML/MM requires a nonempty first-shell QM water region')
+            raise ValueError('Mixed embedding requires a nonempty first-shell QM water region')
         if int(atoms.info.get('qm_water_count', -1)) != args.qm_water_count:
             raise ValueError('QM water count differs from initial structure metadata')
+    mechanical_qm_charges = None
+    if args.mode == 'mechanical':
+        if args.mechanical_qm_charges is None:
+            raise ValueError('--mechanical-qm-charges is required in mechanical mode')
+        charge_data = json.loads(args.mechanical_qm_charges.read_text())
+        mechanical_qm_charges = np.asarray(charge_data['charges'], dtype=float)
+        expected_numbers = np.asarray(atoms.numbers[:11 + 3*args.qm_water_count])
+        if not np.array_equal(charge_data.get('atomic_numbers'), expected_numbers):
+            raise ValueError('Mechanical charge-file atom order differs from structure')
     initial_h_to_o = np.linalg.norm(atoms.positions[:4]-atoms.positions[10], axis=1)
     if not initial_h_to_o[:2].min() < initial_h_to_o[2:].min():
         raise ValueError('Initial hydrogen maleate proton is not on the left carboxyl')
@@ -248,7 +305,8 @@ def main():
     write(args.output / 'initial.xyz', atoms, format='extxyz')
     force_eval, params, neighbor_fn, shift_fn, n_qm = build_energy(
         atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,
-        args.qm_water_count, args.restraint_radius, args.restraint_k
+        args.qm_water_count, args.restraint_radius, args.restraint_k,
+        mechanical_qm_charges
     )
     checkpoint = args.output / 'checkpoint.npz'
     if checkpoint.exists():
@@ -312,9 +370,12 @@ def main():
             'elapsed_seconds_this_process': time.perf_counter()-started,
             'last_sample': samples[-1] if samples else None,
             'cpu_only': os.environ.get('JAX_PLATFORMS') == 'cpu',
-            'qm_water_count': args.qm_water_count if args.mode == 'mlmm' else 52,
-            'restraint_radius_angstrom': args.restraint_radius if args.mode == 'mlmm' else None,
-            'restraint_k_eV_per_angstrom2': args.restraint_k if args.mode == 'mlmm' else None,
+            'qm_water_count': args.qm_water_count if args.mode != 'polar' else 52,
+            'restraint_radius_angstrom': args.restraint_radius if args.mode != 'polar' else None,
+            'restraint_k_eV_per_angstrom2': args.restraint_k if args.mode != 'polar' else None,
+            'mechanical_qm_charges': (
+                str(args.mechanical_qm_charges) if args.mode == 'mechanical' else None
+            ),
         }
         (args.output / 'progress.json').write_text(json.dumps(progress, indent=2)+'\n')
         print(json.dumps(progress), flush=True)
