@@ -18,9 +18,16 @@ from render_comparison import align_top_view, centered_positions, solute_bonds, 
 from symmetrized_free_energy import CENTERS, bootstrap, free_energy, read_samples
 
 
-COLORS = {'Full MACE-POLAR': '#254b8d', 'First-shell ML/MM': '#d06a29'}
-FOLDERS = {'Full MACE-POLAR': 'HydrogenMaleate-MACE-POLAR',
-           'First-shell ML/MM': 'HydrogenMaleate-MLMM'}
+COLORS = {
+    'Full MACE-POLAR': '#254b8d',
+    'Electrostatic embedding': '#d06a29',
+    'Mechanical embedding': '#36845b',
+}
+FOLDERS = {
+    'Full MACE-POLAR': 'HydrogenMaleate-MACE-POLAR',
+    'Electrostatic embedding': 'HydrogenMaleate-MLMM',
+    'Mechanical embedding': 'HydrogenMaleate-Mechanical',
+}
 
 
 def draw_molecule(ax, initial: Path) -> None:
@@ -85,15 +92,27 @@ def draw_free_energy(
             q = array[:, 1]
             analyzed_time = array[-1, 0]
         profile, barrier = free_energy(q, 0.075)
-        profiles, barriers = bootstrap(q, 0.075, 100, 400,
-                                       np.random.default_rng(20260923 + number))
-        lower, upper = np.percentile(profiles, (16, 84), axis=0)
-        ax.plot(CENTERS, profile, color=COLORS[label], linewidth=2.3, label=label)
-        ax.fill_between(CENTERS, lower, upper, color=COLORS[label], alpha=0.18)
+        enough_for_blocks = len(q) >= 100
+        if enough_for_blocks:
+            profiles, barriers = bootstrap(
+                q, 0.075, 100, 400, np.random.default_rng(20260923 + number)
+            )
+            lower, upper = np.percentile(profiles, (16, 84), axis=0)
+        curve_label = f'{label} ({analyzed_time:.1f} ps)'
+        ax.plot(
+            CENTERS, profile, color=COLORS[label], linewidth=2.3,
+            label=curve_label,
+        )
+        if enough_for_blocks:
+            ax.fill_between(CENTERS, lower, upper, color=COLORS[label], alpha=0.18)
         summary['runs'][label] = {
             'frames': len(q), 'analyzed_time_ps': float(analyzed_time),
             'barrier_kBT': barrier,
-            'barrier_95_percent_kBT': np.percentile(barriers, (2.5, 97.5)).tolist(),
+            'barrier_95_percent_kBT': (
+                np.percentile(barriers, (2.5, 97.5)).tolist()
+                if enough_for_blocks else None
+            ),
+            'one_ps_block_uncertainty_available': enough_for_blocks,
         }
     ax.set_xlim(-0.82, 0.82)
     ax.set_ylim(0, 4.2)
@@ -105,10 +124,7 @@ def draw_free_energy(
     interval_text = (
         f'matched {common_end:.1f} ps'
         if analysis_window == 'matched'
-        else (
-            f'available: POLAR {available_end["Full MACE-POLAR"]:.1f} ps, '
-            f'ML/MM {available_end["First-shell ML/MM"]:.1f} ps'
-        )
+        else 'all available frames'
     )
     ax.text(0.03, 0.94,
             rf'$\beta=(k_{{\mathrm{{B}}}}T)^{{-1}}$, $T=330$ K · {interval_text}',
@@ -116,7 +132,7 @@ def draw_free_energy(
     ax.legend(frameon=False, loc='upper center', bbox_to_anchor=(0.5, 0.83),
               fontsize=9.5)
     ax.grid(axis='y', color='#e3e7e9', linewidth=0.8)
-    ax.text(0.5, -0.18, 'Shading: 16–84% from 1 ps block bootstrap',
+    ax.text(0.5, -0.18, 'Shading: 16–84% from 1 ps blocks when ≥1 ps is available',
             transform=ax.transAxes, ha='center', fontsize=9, color='#596169')
     return summary
 
@@ -149,8 +165,12 @@ def throughput_from_log(path: Path) -> dict:
 
 
 def draw_throughput(ax, examples: Path) -> dict:
+    def log_path(folder: str) -> Path:
+        primary = examples / folder / 'md-100ps/run.log'
+        return primary if primary.exists() else examples / folder / 'run.log'
+
     result = {
-        label: throughput_from_log(examples / folder / 'md-100ps/run.log')
+        label: throughput_from_log(log_path(folder))
         for label, folder in FOLDERS.items()
     }
     labels = list(result)
@@ -162,10 +182,11 @@ def draw_throughput(ax, examples: Path) -> dict:
     # The chunk quantiles can be asymmetric around the overall time-weighted rate.
     lower = np.maximum(lower, 0)
     upper = np.maximum(upper, 0)
-    bars = ax.bar(np.arange(2), heights, yerr=[lower, upper], capsize=4,
+    x = np.arange(len(labels))
+    bars = ax.bar(x, heights, yerr=[lower, upper], capsize=4,
                   color=[COLORS[label] for label in labels], width=0.58,
                   error_kw={'elinewidth': 1.3, 'ecolor': '#56616a'})
-    ax.set_xticks(np.arange(2), ['Full\nMACE-POLAR', 'First-shell\nML/MM'])
+    ax.set_xticks(x, ['Full\nMACE-POLAR', 'Electrostatic', 'Mechanical'])
     ax.set_ylabel('Throughput (ps/day)', fontsize=12)
     ax.set_ylim(0, max(result[label]['chunk_10_90_percent_ps_per_day'][1]
                        for label in labels) * 1.15)
