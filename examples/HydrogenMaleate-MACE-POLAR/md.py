@@ -344,7 +344,7 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         if mode_name == 'mechanical' and reciprocal_method == 'pme':
             inputs['mechanical_qm_charges'] = mechanical_qm_charges
         model_result = nnx.merge(graphdef, model_params)(
-            inputs, compute_force=False, pbc_handling=periodic_mode
+            inputs, pbc_handling=periodic_mode
         )
         polar_energy = model_result['energy'][0]
         if mode_name == 'polar':
