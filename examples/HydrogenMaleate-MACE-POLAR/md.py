@@ -9,6 +9,7 @@ import math
 import os
 import time
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,7 @@ from ase.io import read, write
 from common import graph_edges, initialize_model
 from flax import nnx
 from jax.scipy.special import erf, erfc
+from jax_md import partition, space
 
 from mace_jax.modules.polar_electrostatics import FIELD_CONSTANT
 from mace_jax.modules.polar_periodic import ewald_neutralizing_background_energy
@@ -45,6 +47,47 @@ SOLUTE_EPS = np.array([
 ]) * KJ_MOL_TO_EV
 
 
+class EnergyNeighbors(NamedTuple):
+    """Fixed-capacity neighbor lists carried through the compiled MD loop."""
+
+    model: Any
+    nonbonded: Any | None
+
+    @property
+    def did_buffer_overflow(self):
+        overflow = self.model.did_buffer_overflow
+        if self.nonbonded is not None:
+            overflow = overflow | self.nonbonded.did_buffer_overflow
+        return overflow
+
+
+class EnergyNeighborFns:
+    """Allocate and update the model and MM nonbonded neighbor lists together."""
+
+    def __init__(self, model, nonbonded, n_qm):
+        self.model = model
+        self.nonbonded = nonbonded
+        self.n_qm = n_qm
+
+    def allocate(self, positions):
+        model_neighbors = self.model.allocate(positions[:self.n_qm])
+        nonbonded_neighbors = (
+            None if self.nonbonded is None else self.nonbonded.allocate(positions)
+        )
+        return EnergyNeighbors(model_neighbors, nonbonded_neighbors)
+
+    def update(self, positions, neighbors):
+        model_neighbors = self.model.update(
+            positions[:self.n_qm], neighbors.model
+        )
+        nonbonded_neighbors = (
+            None
+            if self.nonbonded is None
+            else self.nonbonded.update(positions, neighbors.nonbonded)
+        )
+        return EnergyNeighbors(model_neighbors, nonbonded_neighbors)
+
+
 def minimum_image(delta, box):
     return delta - box * jnp.round(delta / box)
 
@@ -61,8 +104,122 @@ def generate_velocities(atoms, temperature, seed):
     return velocities * np.sqrt(target / kinetic)
 
 
+def sparse_nonbonded_terms(
+    positions,
+    pair_index,
+    n_qm,
+    mm_charges,
+    alpha,
+    cutoff,
+    box,
+    cross_sigma,
+    cross_epsilon,
+    mechanical_qm_charges=None,
+):
+    """Evaluate real-space MM terms from an unordered JAX-MD edge list."""
+    n_atoms = positions.shape[0]
+    n_mm = mm_charges.shape[0]
+    atom_i, atom_j = pair_index
+    valid = (atom_i < n_atoms) & (atom_j < n_atoms)
+    atom_i = jnp.where(valid, atom_i, 0)
+    atom_j = jnp.where(valid, atom_j, 0)
+    delta = minimum_image(positions[atom_i] - positions[atom_j], box)
+    distance = jnp.sqrt(jnp.sum(delta * delta, axis=-1) + 1e-24)
+    within_cutoff = valid & (distance < cutoff)
+
+    i_is_qm = atom_i < n_qm
+    j_is_qm = atom_j < n_qm
+    i_mm = jnp.clip(atom_i - n_qm, 0, n_mm - 1)
+    j_mm = jnp.clip(atom_j - n_qm, 0, n_mm - 1)
+
+    # Flexible TIP3P excludes all intramolecular nonbonded pairs. Reciprocal
+    # exclusions are restored separately by the Ewald exception term.
+    mm_pair = (
+        within_cutoff
+        & ~i_is_qm
+        & ~j_is_qm
+        & ((i_mm // 3) != (j_mm // 3))
+    )
+    mm_safe = jnp.where(mm_pair, distance, 1.0)
+    mm_real = COULOMB * jnp.sum(
+        jnp.where(
+            mm_pair,
+            mm_charges[i_mm] * mm_charges[j_mm]
+            * erfc(alpha * mm_safe) / mm_safe,
+            0.0,
+        )
+    )
+    mm_oo = mm_pair & ((i_mm % 3) == 0) & ((j_mm % 3) == 0)
+    mm_lj_distance = jnp.where(mm_oo, distance, 1.0)
+    mm_lj_x6 = (TIP3P_SIGMA / mm_lj_distance) ** 6
+    mm_lj = jnp.sum(
+        jnp.where(mm_oo, 4 * TIP3P_EPS * (mm_lj_x6**2 - mm_lj_x6), 0.0)
+    )
+
+    cross_pair = within_cutoff & (i_is_qm ^ j_is_qm)
+    qm_index = jnp.where(i_is_qm, atom_i, atom_j)
+    mm_index = jnp.where(i_is_qm, j_mm, i_mm)
+    mm_is_oxygen = (mm_index % 3) == 0
+
+    solute_pair = cross_pair & mm_is_oxygen & (qm_index < 11)
+    solute_index = jnp.clip(qm_index, 0, 10)
+    solute_distance = jnp.where(solute_pair, distance, 1.0)
+    solute_x6 = (cross_sigma[solute_index] / solute_distance) ** 6
+    cross_lj = jnp.sum(
+        jnp.where(
+            solute_pair,
+            4 * cross_epsilon[solute_index] * (solute_x6**2 - solute_x6),
+            0.0,
+        )
+    )
+
+    qm_water_oxygen = (qm_index >= 11) & (((qm_index - 11) % 3) == 0)
+    water_pair = cross_pair & mm_is_oxygen & qm_water_oxygen
+    water_distance = jnp.where(water_pair, distance, 1.0)
+    water_x6 = (TIP3P_SIGMA / water_distance) ** 6
+    cross_lj += jnp.sum(
+        jnp.where(
+            water_pair,
+            4 * TIP3P_EPS * (water_x6**2 - water_x6),
+            0.0,
+        )
+    )
+
+    mechanical_real = jnp.asarray(0.0, dtype=positions.dtype)
+    if mechanical_qm_charges is not None:
+        qm_charge_index = jnp.clip(qm_index, 0, n_qm - 1)
+        cross_safe = jnp.where(cross_pair, distance, 1.0)
+        mechanical_real = COULOMB * jnp.sum(
+            jnp.where(
+                cross_pair,
+                mechanical_qm_charges[qm_charge_index]
+                * mm_charges[mm_index]
+                * erfc(alpha * cross_safe) / cross_safe,
+                0.0,
+            )
+        )
+    return mm_real, mm_lj, cross_lj, mechanical_real
+
+
+def ordered_pairs_from_dense_neighbors(neighbor_index, n_atoms):
+    """Flatten a JAX-MD dense list while retaining each pair exactly once."""
+    atom_i = jnp.broadcast_to(
+        jnp.arange(n_atoms, dtype=neighbor_index.dtype)[:, None],
+        neighbor_index.shape,
+    )
+    keep = atom_i < neighbor_index
+    padding = jnp.asarray(n_atoms, dtype=neighbor_index.dtype)
+    return jnp.stack(
+        (
+            jnp.where(keep, atom_i, padding).reshape(-1),
+            jnp.where(keep, neighbor_index, padding).reshape(-1),
+        )
+    )
+
+
 def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
-                 restraint_radius, restraint_k, mechanical_qm_charges=None):
+                 restraint_radius, restraint_k, mechanical_qm_charges=None,
+                 nonbonded_cutoff=9.0, neighbor_skin=0.25):
     box = float(atoms.cell[0, 0])
     n_qm = len(atoms) if mode_name == 'polar' else 11 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
@@ -73,9 +230,6 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         raise ValueError('MM region must contain complete water triplets')
     mm_count = (len(atoms) - n_qm) // 3
     mm_charges = jnp.asarray(TIP3P_Q * mm_count, dtype=jnp.float64)
-    mm_molecule = np.repeat(np.arange(mm_count), 3)
-    real_mask = jnp.asarray(np.triu(mm_molecule[:, None] != mm_molecule[None], k=1))
-    mm_o_pairs = np.triu_indices(mm_count, k=1)
     exception_i = jnp.asarray([3*i+a for i in range(mm_count) for a in (0, 0, 1)])
     exception_j = jnp.asarray([3*i+b for i in range(mm_count) for b in (1, 2, 2)])
     k_axis = np.arange(-kmax, kmax + 1)
@@ -100,12 +254,27 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         mechanical_qm_charges = jnp.asarray(charge_array, dtype=jnp.float64)
     cross_sigma = jnp.asarray((SOLUTE_SIGMA + TIP3P_SIGMA) / 2)
     cross_epsilon = jnp.asarray(np.sqrt(SOLUTE_EPS * TIP3P_EPS))
+    if mode_name == 'polar':
+        energy_neighbor_fn = EnergyNeighborFns(neighbor_fn, None, n_qm)
+    else:
+        if nonbonded_cutoff is None:
+            nonbonded_cutoff = min(9.0, 0.49 * box)
+        if nonbonded_cutoff <= 0 or neighbor_skin < 0:
+            raise ValueError('Nonbonded cutoff must be positive and skin nonnegative')
+        displacement, _ = space.periodic(box)
+        nonbonded_neighbor_fn = partition.neighbor_list(
+            displacement,
+            box,
+            nonbonded_cutoff,
+            dr_threshold=neighbor_skin,
+            capacity_multiplier=1.3,
+            format=partition.Dense,
+        )
+        energy_neighbor_fn = EnergyNeighborFns(
+            neighbor_fn, nonbonded_neighbor_fn, n_qm
+        )
 
-    def lj(r, sigma, epsilon):
-        x6 = (sigma / r) ** 6
-        return 4 * epsilon * (x6*x6 - x6)
-
-    def mm_terms(mm_r, qm_r):
+    def mm_internal_terms(mm_r):
         waters = mm_r.reshape(-1, 3, 3)
         oh1 = minimum_image(waters[:, 1] - waters[:, 0], box)
         oh2 = minimum_image(waters[:, 2] - waters[:, 0], box)
@@ -114,26 +283,6 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         angle = jnp.arccos(jnp.clip(cosine, -1+1e-12, 1-1e-12))
         bonded = 0.5*OH_K*jnp.sum((r1-OH_R0)**2 + (r2-OH_R0)**2)
         bonded += 0.5*HOH_K*jnp.sum((angle-HOH_THETA0)**2)
-        mm_o = waters[:, 0]
-        oo = minimum_image(mm_o[mm_o_pairs[0]] - mm_o[mm_o_pairs[1]], box)
-        mm_lj = jnp.sum(lj(jnp.linalg.norm(oo, axis=-1), TIP3P_SIGMA, TIP3P_EPS))
-        solute_cross = minimum_image(qm_r[:11, None] - mm_o[None], box)
-        solute_cross_r = jnp.linalg.norm(solute_cross, axis=-1)
-        cross_lj = jnp.sum(lj(
-            solute_cross_r, cross_sigma[:, None], cross_epsilon[:, None]
-        ))
-        # QM water O - MM water O uses the same TIP3P Lennard-Jones type.
-        qm_water_o = qm_r[11::3]
-        water_cross = minimum_image(qm_water_o[:, None] - mm_o[None], box)
-        cross_lj += jnp.sum(lj(
-            jnp.linalg.norm(water_cross, axis=-1), TIP3P_SIGMA, TIP3P_EPS
-        ))
-
-        delta = minimum_image(mm_r[:, None] - mm_r[None], box)
-        distances = jnp.sqrt(jnp.sum(delta*delta, axis=-1) + 1e-24)
-        safe = jnp.where(real_mask, distances, 1.0)
-        pair_q = mm_charges[:, None] * mm_charges[None]
-        real = COULOMB*jnp.sum(jnp.where(real_mask, pair_q*erfc(alpha*safe)/safe, 0.0))
         phase = k_vectors @ mm_r.T
         c, s = jnp.cos(phase) @ mm_charges, jnp.sin(phase) @ mm_charges
         reciprocal = COULOMB*2*math.pi/box**3*jnp.sum(k_weights*(c*c+s*s))
@@ -147,21 +296,10 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
             mm_charges[exception_i]*mm_charges[exception_j]
             *erf(alpha*excluded_r)/excluded_r
         )
-        return (
-            bonded + mm_lj + cross_lj + real + reciprocal + self_energy
-            + background + exceptions
-        )
+        return bonded + reciprocal + self_energy + background + exceptions
 
     def mechanical_cross_electrostatics(qm_r, mm_r):
         """Fixed-charge QM--MM Ewald cross term used by mechanical embedding."""
-        delta = minimum_image(qm_r[:, None] - mm_r[None], box)
-        distances = jnp.linalg.norm(delta, axis=-1)
-        real = COULOMB * jnp.sum(
-            mechanical_qm_charges[:, None]
-            * mm_charges[None]
-            * erfc(alpha * distances)
-            / distances
-        )
         qm_phase = k_vectors @ qm_r.T
         mm_phase = k_vectors @ mm_r.T
         qm_c = jnp.cos(qm_phase) @ mechanical_qm_charges
@@ -179,7 +317,7 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
             - ewald_neutralizing_background_energy(q_qm, box**3, alpha)
             - ewald_neutralizing_background_energy(q_mm, box**3, alpha)
         )
-        return real + reciprocal + background
+        return reciprocal + background
 
     def boundary_restraint(qm_r):
         # Restrain only first-shell water oxygens, with zero energy/force
@@ -193,7 +331,9 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
 
     def energy_fn(r, neighbors, model_params):
         qm_r = r[:n_qm]
-        edge_index, shifts, unit_shifts = graph_edges(qm_r, neighbors, box)
+        edge_index, shifts, unit_shifts = graph_edges(
+            qm_r, neighbors.model, box
+        )
         inputs = dict(
             data, positions=qm_r, edge_index=edge_index,
             shifts=shifts, unit_shifts=unit_shifts,
@@ -206,12 +346,38 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         )['energy'][0]
         if mode_name == 'polar':
             return polar_energy
-        energy = polar_energy + mm_terms(r[n_qm:], qm_r) + boundary_restraint(qm_r)
+        mm_real, mm_lj, cross_lj, mechanical_real = sparse_nonbonded_terms(
+            r,
+            ordered_pairs_from_dense_neighbors(
+                neighbors.nonbonded.idx, r.shape[0]
+            ),
+            n_qm,
+            mm_charges,
+            alpha,
+            nonbonded_cutoff,
+            box,
+            cross_sigma,
+            cross_epsilon,
+            mechanical_qm_charges if mode_name == 'mechanical' else None,
+        )
+        energy = (
+            polar_energy
+            + mm_internal_terms(r[n_qm:])
+            + mm_real
+            + mm_lj
+            + cross_lj
+            + boundary_restraint(qm_r)
+        )
         if mode_name == 'mechanical':
-            energy += mechanical_cross_electrostatics(qm_r, r[n_qm:])
+            energy += mechanical_real + mechanical_cross_electrostatics(
+                qm_r, r[n_qm:]
+            )
         return energy
 
-    return jax.jit(jax.value_and_grad(energy_fn)), params, neighbor_fn, shift_fn, n_qm
+    return (
+        jax.jit(jax.value_and_grad(energy_fn)), params, energy_neighbor_fn,
+        shift_fn, n_qm,
+    )
 
 
 def write_chunk(args, atoms, position_series, energy_series, kinetic_series, start_step):
@@ -271,6 +437,8 @@ def main():
     parser.add_argument('--report-interval', type=int, default=200)
     parser.add_argument('--ewald-alpha', type=float, default=0.5)
     parser.add_argument('--ewald-kmax', type=int, default=6)
+    parser.add_argument('--nonbonded-cutoff', type=float)
+    parser.add_argument('--neighbor-skin', type=float, default=0.25)
     parser.add_argument('--qm-water-count', type=int, default=0)
     parser.add_argument('--restraint-radius', type=float, default=4.2)
     parser.add_argument('--restraint-k', type=float, default=0.2)
@@ -283,6 +451,8 @@ def main():
     atoms = read(args.initial)
     if len(atoms) != 167:
         raise ValueError('Expected 11 hydrogen maleate atoms and 52 waters')
+    if args.nonbonded_cutoff is None:
+        args.nonbonded_cutoff = min(9.0, 0.49 * float(atoms.cell[0, 0]))
     if args.mode != 'polar':
         if not 1 <= args.qm_water_count < 52:
             raise ValueError('Mixed embedding requires a nonempty first-shell QM water region')
@@ -306,7 +476,7 @@ def main():
     force_eval, params, neighbor_fn, shift_fn, n_qm = build_energy(
         atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,
         args.qm_water_count, args.restraint_radius, args.restraint_k,
-        mechanical_qm_charges
+        mechanical_qm_charges, args.nonbonded_cutoff, args.neighbor_skin,
     )
     checkpoint = args.output / 'checkpoint.npz'
     if checkpoint.exists():
@@ -320,7 +490,7 @@ def main():
         positions = jnp.asarray(atoms.positions, dtype=jnp.float64)
         velocities = jnp.asarray(generate_velocities(atoms, args.temperature_k, args.seed))
     masses = jnp.asarray(atoms.get_masses()[:, None], dtype=jnp.float64)
-    neighbors = neighbor_fn.allocate(positions[:n_qm])
+    neighbors = neighbor_fn.allocate(positions)
     compile_start = time.perf_counter()
     initial_energy, initial_grad = force_eval(positions, neighbors, params)
     initial_energy.block_until_ready()
@@ -336,7 +506,7 @@ def main():
         noise = jax.random.normal(jax.random.fold_in(jax.random.PRNGKey(args.seed+1), absolute_step), r.shape)
         v = c*v + noise_scale*noise
         r = shift_fn(r, 0.5*dt*v)
-        nbrs = neighbor_fn.update(r[:n_qm], nbrs)
+        nbrs = neighbor_fn.update(r, nbrs)
         new_energy, new_grad = force_eval(r, nbrs, params)
         v = v - 0.5*dt*new_grad/masses
         kinetic = 0.5*jnp.sum(masses*v*v)
@@ -373,6 +543,12 @@ def main():
             'qm_water_count': args.qm_water_count if args.mode != 'polar' else 52,
             'restraint_radius_angstrom': args.restraint_radius if args.mode != 'polar' else None,
             'restraint_k_eV_per_angstrom2': args.restraint_k if args.mode != 'polar' else None,
+            'nonbonded_cutoff_angstrom': (
+                args.nonbonded_cutoff if args.mode != 'polar' else None
+            ),
+            'neighbor_skin_angstrom': (
+                args.neighbor_skin if args.mode != 'polar' else None
+            ),
             'mechanical_qm_charges': (
                 str(args.mechanical_qm_charges) if args.mode == 'mechanical' else None
             ),

@@ -24,3 +24,9 @@ Sci.* **23**, 6302 (2022), DOI 10.3390/ijms23116302.
 Saved frames record the proton distance to both carboxylates and
 `proton_coordinate_angstrom = right - left`; a sign change marks transfer.
 Both jobs are restartable from atomic checkpoints.
+
+MM real-space Coulomb and Lennard-Jones interactions use a JAX-MD neighbor
+list. The default nonbonded cutoff is the smaller of 9.0 Å and 49% of the box
+length (5.76 Å for this cell), with a 0.25 Å neighbor skin. Both are
+configurable with `--nonbonded-cutoff` and `--neighbor-skin`. The reciprocal
+Ewald calculation is unchanged.

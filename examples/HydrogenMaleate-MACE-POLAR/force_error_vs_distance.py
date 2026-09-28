@@ -21,9 +21,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from ase.io import read
-
 from md import build_energy
-
 
 CARBOXYL_OXYGENS = np.asarray([0, 1, 2, 3])
 SOLUTE_ATOMS = 11
@@ -148,12 +146,16 @@ def main() -> None:
     parser.add_argument("--restraint-k", type=float, default=0.2)
     parser.add_argument("--ewald-alpha", type=float, default=0.5)
     parser.add_argument("--ewald-kmax", type=int, default=6)
+    parser.add_argument("--nonbonded-cutoff", type=float)
+    parser.add_argument("--neighbor-skin", type=float, default=0.25)
     parser.add_argument("--radial-bin-width", type=float, default=0.5)
     args = parser.parse_args()
 
     atoms = read(args.initial)
     atoms.info["qm_water_count"] = args.qm_water_count
     box = float(atoms.cell[0, 0])
+    if args.nonbonded_cutoff is None:
+        args.nonbonded_cutoff = min(9.0, 0.49 * box)
     qm_atom_count = SOLUTE_ATOMS + 3 * args.qm_water_count
     if len(atoms) != 167 or qm_atom_count >= len(atoms):
         raise ValueError("Expected hydrogen maleate, a nonempty QM water shell, and MM water")
@@ -167,6 +169,9 @@ def main() -> None:
         args.qm_water_count,
         args.restraint_radius,
         args.restraint_k,
+        None,
+        args.nonbonded_cutoff,
+        args.neighbor_skin,
     )
     mixed_eval, mixed_params, mixed_neighbor_fn, _, mixed_count = build_energy(
         atoms,
@@ -177,6 +182,9 @@ def main() -> None:
         args.qm_water_count,
         args.restraint_radius,
         args.restraint_k,
+        None,
+        args.nonbonded_cutoff,
+        args.neighbor_skin,
     )
     mechanical_eval = mechanical_params = mechanical_neighbor_fn = None
     mechanical_charge_metadata = None
@@ -209,6 +217,8 @@ def main() -> None:
             args.restraint_radius,
             args.restraint_k,
             mechanical_charges,
+            args.nonbonded_cutoff,
+            args.neighbor_skin,
         )
         if mechanical_count != qm_atom_count:
             raise RuntimeError("Unexpected mechanical model partition")
@@ -224,11 +234,9 @@ def main() -> None:
         times_ps.append(float(frame.info["time_fs"]) / 1000)
 
     full_neighbors = full_neighbor_fn.allocate(jnp.asarray(positions[0]))
-    mixed_neighbors = mixed_neighbor_fn.allocate(
-        jnp.asarray(positions[0][:qm_atom_count])
-    )
+    mixed_neighbors = mixed_neighbor_fn.allocate(jnp.asarray(positions[0]))
     mechanical_neighbors = (
-        mechanical_neighbor_fn.allocate(jnp.asarray(positions[0][:qm_atom_count]))
+        mechanical_neighbor_fn.allocate(jnp.asarray(positions[0]))
         if mechanical_neighbor_fn is not None
         else None
     )
@@ -242,12 +250,10 @@ def main() -> None:
     for sample_index, xyz in enumerate(positions):
         xyz_jax = jnp.asarray(xyz)
         full_neighbors = full_neighbor_fn.update(xyz_jax, full_neighbors)
-        mixed_neighbors = mixed_neighbor_fn.update(
-            xyz_jax[:qm_atom_count], mixed_neighbors
-        )
+        mixed_neighbors = mixed_neighbor_fn.update(xyz_jax, mixed_neighbors)
         if mechanical_neighbor_fn is not None:
             mechanical_neighbors = mechanical_neighbor_fn.update(
-                xyz_jax[:qm_atom_count], mechanical_neighbors
+                xyz_jax, mechanical_neighbors
             )
         if bool(full_neighbors.did_buffer_overflow) or bool(
             mixed_neighbors.did_buffer_overflow
@@ -312,6 +318,8 @@ def main() -> None:
         "qm_water_count": args.qm_water_count,
         "qm_atom_count": qm_atom_count,
         "mm_atom_count": len(atoms) - qm_atom_count,
+        "nonbonded_cutoff_angstrom": args.nonbonded_cutoff,
+        "neighbor_skin_angstrom": args.neighbor_skin,
         "mechanical_fixed_charges": mechanical_charge_metadata,
         "restraint": {
             "radius_angstrom": args.restraint_radius,
