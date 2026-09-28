@@ -177,12 +177,16 @@ class PolarMACE(ScaleShiftMACE):
         data: dict[str, jnp.ndarray],
         *,
         pbc_handling: str | None = None,
+        generalized_pme: bool = False,
+        pme_mesh_spacing: float = 0.5,
+        pme_assignment_order: int = 8,
     ) -> tuple[str, dict[str, jnp.ndarray]]:
-        """Resolve the electrostatics mode and reciprocal indices on the host.
+        """Resolve electrostatics mode and reciprocal layout on the host.
 
         Pass the returned mode as ``pbc_handling`` to the compiled model call.
-        The coefficient set is fixed for the reference cell; changes that alter
-        that set require preparing the data again.
+        Direct mode fixes the reciprocal coefficient set. Generalized PME fixes
+        the mesh shape and B-spline order. Cell changes that require a different
+        coefficient set or mesh shape require preparing the data again.
         """
         mode = self.pbc_handling if pbc_handling is None else pbc_handling
         if mode == 'auto':
@@ -206,14 +210,27 @@ class PolarMACE(ScaleShiftMACE):
         if mode != 'realspace':
             if data.get('pbc') is None:
                 raise ValueError('Periodic POLAR requires per-graph pbc data')
-            coefficients, k_batch, k0_mask = (
-                self.periodic_electrostatics.prepare_coefficients(
-                    data.get('reference_cell', data['cell'])
+            if generalized_pme:
+                if mode != 'pbc':
+                    raise ValueError('Generalized PME currently supports pbc mode only')
+                mesh, assignment = (
+                    self.periodic_electrostatics.prepare_mesh_template(
+                        data.get('reference_cell', data['cell']),
+                        mesh_spacing=pme_mesh_spacing,
+                        assignment_order=pme_assignment_order,
+                    )
                 )
-            )
-            prepared['kspace_coefficients'] = coefficients
-            prepared['kspace_batch'] = k_batch
-            prepared['kspace_k0_mask'] = k0_mask
+                prepared['pme_mesh_template'] = mesh
+                prepared['pme_assignment_template'] = assignment
+            else:
+                coefficients, k_batch, k0_mask = (
+                    self.periodic_electrostatics.prepare_coefficients(
+                        data.get('reference_cell', data['cell'])
+                    )
+                )
+                prepared['kspace_coefficients'] = coefficients
+                prepared['kspace_batch'] = k_batch
+                prepared['kspace_k0_mask'] = k0_mask
         return mode, prepared
 
     def __call__(
@@ -250,25 +267,50 @@ class PolarMACE(ScaleShiftMACE):
         batch = data['batch']
         positions = data['positions']
         periodic_cache = None
+        generalized_pme = False
         if periodic:
-            coefficient_keys = ('kspace_coefficients', 'kspace_batch', 'kspace_k0_mask')
-            provided = [key in data for key in coefficient_keys]
-            if any(provided) and not all(provided):
-                raise ValueError('Periodic POLAR requires all three kspace arrays')
-            coefficients = (
-                tuple(data[key] for key in coefficient_keys) if all(provided) else None
-            )
-            periodic_cache = self.periodic_electrostatics.precompute(
-                positions,
-                batch,
-                data['cell'],
-                data.get('reference_cell'),
-                coefficients=coefficients,
-            )
+            mesh_keys = ('pme_mesh_template', 'pme_assignment_template')
+            mesh_provided = [key in data for key in mesh_keys]
+            if any(mesh_provided) and not all(mesh_provided):
+                raise ValueError('Generalized PME requires both mesh templates')
+            generalized_pme = all(mesh_provided)
+            if generalized_pme:
+                periodic_cache = self.periodic_electrostatics.precompute_mesh(
+                    positions,
+                    batch,
+                    data['cell'],
+                    data['pme_mesh_template'],
+                    data['pme_assignment_template'],
+                )
+            else:
+                coefficient_keys = (
+                    'kspace_coefficients', 'kspace_batch', 'kspace_k0_mask'
+                )
+                provided = [key in data for key in coefficient_keys]
+                if any(provided) and not all(provided):
+                    raise ValueError('Periodic POLAR requires all three kspace arrays')
+                coefficients = (
+                    tuple(data[key] for key in coefficient_keys)
+                    if all(provided)
+                    else None
+                )
+                periodic_cache = self.periodic_electrostatics.precompute(
+                    positions,
+                    batch,
+                    data['cell'],
+                    data.get('reference_cell'),
+                    coefficients=coefficients,
+                )
         mm_positions = data.get('mm_positions')
         mm_charges = data.get('mm_charges')
+        mechanical_embedding = data.get('mechanical_qm_charges') is not None
         if (mm_positions is None) != (mm_charges is None):
             raise ValueError('MM positions and charges must be provided together')
+        if mechanical_embedding and (mm_positions is None or not generalized_pme):
+            raise ValueError(
+                'Mechanical PME output requires MM positions, charges, and '
+                'generalized PME'
+            )
         if mm_positions is not None and not periodic:
             raise ValueError('MM embedding requires periodic electrostatics')
         if mm_positions is not None and mode != 'pbc':
@@ -277,12 +319,25 @@ class PolarMACE(ScaleShiftMACE):
         num_graphs = int(data['ptr'].shape[0] - 1)
         if mm_positions is not None and num_graphs != 1:
             raise ValueError('MM embedding currently supports one graph')
-        half_mm_field = (
-            0.5
-            * self.periodic_electrostatics.point_charge_field_features(
+        mm_mesh_density = (
+            self.periodic_electrostatics.mesh_point_charge_density(
                 mm_positions, mm_charges, periodic_cache
             )
-            if mm_positions is not None
+            if mm_positions is not None and generalized_pme
+            else None
+        )
+        half_mm_field = (
+            0.5
+            * (
+                self.periodic_electrostatics.mesh_point_charge_field_features(
+                    mm_mesh_density, periodic_cache
+                )
+                if generalized_pme
+                else self.periodic_electrostatics.point_charge_field_features(
+                    mm_positions, mm_charges, periodic_cache
+                )
+            )
+            if mm_positions is not None and not mechanical_embedding
             else 0.0
         )
         node_feats_list = jnp.split(
@@ -366,18 +421,26 @@ class PolarMACE(ScaleShiftMACE):
                     spin_charge_density[:, 1, :], positions, batch
                 )
             else:
-                alpha = self.periodic_electrostatics.field_features(
-                    spin_charge_density[:, 0, :],
-                    periodic_cache,
-                    mode=periodic_mode,
-                    pbc=pbc,
-                )
-                beta = self.periodic_electrostatics.field_features(
-                    spin_charge_density[:, 1, :],
-                    periodic_cache,
-                    mode=periodic_mode,
-                    pbc=pbc,
-                )
+                if generalized_pme:
+                    alpha = self.periodic_electrostatics.mesh_field_features(
+                        spin_charge_density[:, 0, :], periodic_cache
+                    )
+                    beta = self.periodic_electrostatics.mesh_field_features(
+                        spin_charge_density[:, 1, :], periodic_cache
+                    )
+                else:
+                    alpha = self.periodic_electrostatics.field_features(
+                        spin_charge_density[:, 0, :],
+                        periodic_cache,
+                        mode=periodic_mode,
+                        pbc=pbc,
+                    )
+                    beta = self.periodic_electrostatics.field_features(
+                        spin_charge_density[:, 1, :],
+                        periodic_cache,
+                        mode=periodic_mode,
+                        pbc=pbc,
+                    )
             alpha = (alpha + half_external + half_mm_field) / self.field_feature_norms
             beta = (beta + half_external + half_mm_field) / self.field_feature_norms
             potential_features = jnp.concatenate((alpha, beta), axis=-1)
@@ -423,22 +486,67 @@ class PolarMACE(ScaleShiftMACE):
                 dim_size=num_graphs,
             )
         cross_electrostatic_energy = jnp.zeros((num_graphs,), dtype=positions.dtype)
+        mm_ewald_reciprocal_energy = jnp.zeros(
+            (num_graphs,), dtype=positions.dtype
+        )
+        mechanical_ewald_cross_energy = jnp.zeros(
+            (num_graphs,), dtype=positions.dtype
+        )
         if periodic_cache is None:
             electrostatic_energy = self.electrostatics.coulomb_energy(
                 density, positions, batch, num_graphs
             )
         elif mm_positions is not None:
-            electrostatic_energy, cross_electrostatic_energy = (
-                self.periodic_electrostatics.mixed_coulomb_energy(
-                    density, mm_positions, mm_charges, periodic_cache
+            if generalized_pme:
+                if mechanical_embedding:
+                    electrostatic_energy = (
+                        self.periodic_electrostatics.mesh_coulomb_energy(
+                            density, periodic_cache
+                        )
+                    )
+                else:
+                    electrostatic_energy, cross_electrostatic_energy = (
+                        self.periodic_electrostatics.mesh_mixed_coulomb_energy(
+                            density, mm_mesh_density, periodic_cache
+                        )
+                    )
+                if data.get('mm_ewald_alpha') is not None:
+                    alpha = jnp.asarray(data['mm_ewald_alpha']).reshape(())
+                    mm_ewald_reciprocal_energy = jnp.asarray(
+                        [self.periodic_electrostatics.mesh_point_charge_ewald_reciprocal_energy(
+                            mm_mesh_density, periodic_cache, alpha
+                        )]
+                    )
+                    mechanical_charges = data.get('mechanical_qm_charges')
+                    if mechanical_charges is not None:
+                        qm_point_density = (
+                            self.periodic_electrostatics.mesh_point_charge_density(
+                                positions, mechanical_charges, periodic_cache
+                            )
+                        )
+                        mechanical_ewald_cross_energy = jnp.asarray(
+                            [self.periodic_electrostatics.mesh_point_charge_ewald_cross_energy(
+                                qm_point_density, mm_mesh_density, periodic_cache, alpha
+                            )]
+                        )
+            else:
+                electrostatic_energy, cross_electrostatic_energy = (
+                    self.periodic_electrostatics.mixed_coulomb_energy(
+                        density, mm_positions, mm_charges, periodic_cache
+                    )
                 )
-            )
         else:
-            electrostatic_energy = self.periodic_electrostatics.coulomb_energy(
-                density,
-                periodic_cache,
-                mode=periodic_mode,
-                pbc=pbc,
+            electrostatic_energy = (
+                self.periodic_electrostatics.mesh_coulomb_energy(
+                    density, periodic_cache
+                )
+                if generalized_pme
+                else self.periodic_electrostatics.coulomb_energy(
+                    density,
+                    periodic_cache,
+                    mode=periodic_mode,
+                    pbc=pbc,
+                )
             )
         total_energy = (
             backbone['energy']
@@ -452,6 +560,8 @@ class PolarMACE(ScaleShiftMACE):
             'electron_energy': electron_energy,
             'electrostatic_energy': electrostatic_energy,
             'cross_electrostatic_energy': cross_electrostatic_energy,
+            'mm_ewald_reciprocal_energy': mm_ewald_reciprocal_energy,
+            'mechanical_ewald_cross_energy': mechanical_ewald_cross_energy,
             'density_coefficients': density,
             'spin_density': spin_density,
             'spin_charge_density': spin_charge_density,

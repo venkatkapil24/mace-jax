@@ -51,7 +51,15 @@ def graph_edges(positions, neighbors, box):
     return jnp.stack((sender, receiver)), shifts, unit
 
 
-def initialize_model(atoms, bundle_path, capacity_multiplier=1.3):
+def initialize_model(
+    atoms,
+    bundle_path,
+    capacity_multiplier=1.3,
+    *,
+    generalized_pme=False,
+    pme_mesh_spacing=0.5,
+    pme_assignment_order=8,
+):
     jax.config.update('jax_enable_x64', True)
     box = float(atoms.cell[0, 0])
     if not np.all(atoms.pbc) or not np.allclose(atoms.cell.array, np.eye(3) * box):
@@ -60,7 +68,13 @@ def initialize_model(atoms, bundle_path, capacity_multiplier=1.3):
     model = nnx.merge(bundle.graphdef, bundle.params)
     if model.__class__.__name__ != 'PolarMACE':
         raise ValueError('Expected MACE-POLAR bundle')
-    mode, data = model.prepare_jit_data(model_data(atoms, bundle.config), pbc_handling='pbc')
+    mode, data = model.prepare_jit_data(
+        model_data(atoms, bundle.config),
+        pbc_handling='pbc',
+        generalized_pme=generalized_pme,
+        pme_mesh_spacing=pme_mesh_spacing,
+        pme_assignment_order=pme_assignment_order,
+    )
     graphdef, params = nnx.split(model)
     displacement, shift = space.periodic(box)
     neighbor_fn = partition.neighbor_list(

@@ -146,6 +146,11 @@ def main() -> None:
     parser.add_argument("--restraint-k", type=float, default=0.2)
     parser.add_argument("--ewald-alpha", type=float, default=0.5)
     parser.add_argument("--ewald-kmax", type=int, default=6)
+    parser.add_argument(
+        "--reciprocal-method", choices=["pme", "direct"], default="pme"
+    )
+    parser.add_argument("--pme-mesh-spacing", type=float, default=0.5)
+    parser.add_argument("--pme-assignment-order", type=int, default=8)
     parser.add_argument("--nonbonded-cutoff", type=float)
     parser.add_argument("--neighbor-skin", type=float, default=0.25)
     parser.add_argument("--radial-bin-width", type=float, default=0.5)
@@ -172,6 +177,9 @@ def main() -> None:
         None,
         args.nonbonded_cutoff,
         args.neighbor_skin,
+        args.reciprocal_method,
+        args.pme_mesh_spacing,
+        args.pme_assignment_order,
     )
     mixed_eval, mixed_params, mixed_neighbor_fn, _, mixed_count = build_energy(
         atoms,
@@ -185,6 +193,9 @@ def main() -> None:
         None,
         args.nonbonded_cutoff,
         args.neighbor_skin,
+        args.reciprocal_method,
+        args.pme_mesh_spacing,
+        args.pme_assignment_order,
     )
     mechanical_eval = mechanical_params = mechanical_neighbor_fn = None
     mechanical_charge_metadata = None
@@ -219,6 +230,9 @@ def main() -> None:
             mechanical_charges,
             args.nonbonded_cutoff,
             args.neighbor_skin,
+            args.reciprocal_method,
+            args.pme_mesh_spacing,
+            args.pme_assignment_order,
         )
         if mechanical_count != qm_atom_count:
             raise RuntimeError("Unexpected mechanical model partition")
@@ -331,6 +345,13 @@ def main() -> None:
             "of the four hydrogen-maleate carboxyl oxygens"
         ),
         "force_error_definition": "norm of F_embedding minus F_full for each atom",
+        "reciprocal_method": args.reciprocal_method,
+        "pme_mesh_spacing_angstrom": (
+            args.pme_mesh_spacing if args.reciprocal_method == "pme" else None
+        ),
+        "pme_assignment_order": (
+            args.pme_assignment_order if args.reciprocal_method == "pme" else None
+        ),
         "overall": overall,
         "radial": radial,
     }

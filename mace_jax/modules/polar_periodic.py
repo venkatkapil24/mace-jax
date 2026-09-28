@@ -20,6 +20,83 @@ from .polar_electrostatics import (
 )
 
 
+def _cardinal_bspline_weights(
+    fractional: jnp.ndarray, order: int
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Centered cardinal B-spline offsets and weights for one coordinate."""
+    if order < 2 or order % 2:
+        raise ValueError('PME B-spline order must be an even integer >= 2')
+    offsets = jnp.arange(-order // 2 + 1, order // 2 + 1, dtype=jnp.int32)
+    argument = fractional[..., None] - offsets + order / 2
+    weights = jnp.zeros_like(argument)
+    for index in range(order + 1):
+        weights = weights + (
+            (-1) ** index
+            * math.comb(order, index)
+            * jnp.maximum(argument - index, 0.0) ** (order - 1)
+        )
+    return offsets, weights / math.factorial(order - 1)
+
+
+def _mesh_indices_and_weights(
+    positions: jnp.ndarray,
+    cell: jnp.ndarray,
+    grid_shape: tuple[int, int, int],
+    order: int,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    """Periodic tensor-product B-spline stencil for each particle."""
+    fractional = positions @ jnp.linalg.inv(cell)
+    grid_coordinate = fractional * jnp.asarray(grid_shape, dtype=positions.dtype)
+    base = jnp.floor(grid_coordinate).astype(jnp.int32)
+    remainder = grid_coordinate - base
+    offsets, wx = _cardinal_bspline_weights(remainder[:, 0], order)
+    _, wy = _cardinal_bspline_weights(remainder[:, 1], order)
+    _, wz = _cardinal_bspline_weights(remainder[:, 2], order)
+    ix = (base[:, 0, None] + offsets) % grid_shape[0]
+    iy = (base[:, 1, None] + offsets) % grid_shape[1]
+    iz = (base[:, 2, None] + offsets) % grid_shape[2]
+    weights = (
+        wx[:, :, None, None] * wy[:, None, :, None] * wz[:, None, None, :]
+    )
+    shape = weights.shape
+    return (
+        (
+            jnp.broadcast_to(ix[:, :, None, None], shape),
+            jnp.broadcast_to(iy[:, None, :, None], shape),
+            jnp.broadcast_to(iz[:, None, None, :], shape),
+        ),
+        weights,
+    )
+
+
+def _spread_to_mesh(
+    values: jnp.ndarray,
+    indices: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    weights: jnp.ndarray,
+    grid_shape: tuple[int, int, int],
+) -> jnp.ndarray:
+    """Spread scalar or vector particle values onto a periodic mesh."""
+    if values.ndim == 1:
+        values = values[:, None]
+    contribution = weights[..., None] * values[:, None, None, None, :]
+    ix, iy, iz = indices
+    mesh = jnp.zeros((*grid_shape, values.shape[-1]), dtype=values.dtype)
+    return mesh.at[ix.reshape(-1), iy.reshape(-1), iz.reshape(-1)].add(
+        contribution.reshape(-1, values.shape[-1])
+    )
+
+
+def _gather_from_mesh(
+    mesh: jnp.ndarray,
+    indices: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray],
+    weights: jnp.ndarray,
+) -> jnp.ndarray:
+    """Interpolate mesh channels to particles with the spreading stencil."""
+    ix, iy, iz = indices
+    samples = mesh[ix, iy, iz]
+    return jnp.sum(samples * weights[..., None], axis=(1, 2, 3))
+
+
 def ewald_neutralizing_background_energy(
     total_charge: jnp.ndarray | float,
     volume: jnp.ndarray | float,
@@ -263,6 +340,308 @@ class PeriodicPolarElectrostatics:
             'batch': batch,
             'positions': positions,
         }
+
+    def prepare_mesh_template(
+        self,
+        reference_cell: jnp.ndarray,
+        *,
+        mesh_spacing: float = 0.5,
+        assignment_order: int = 8,
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Create static mesh and assignment templates outside compiled calls."""
+        if mesh_spacing <= 0:
+            raise ValueError('PME mesh spacing must be positive')
+        if assignment_order < 2 or assignment_order % 2:
+            raise ValueError('PME assignment order must be an even integer >= 2')
+        cell = np.asarray(reference_cell).reshape(-1, 3, 3)
+        if cell.shape[0] != 1:
+            raise ValueError('Generalized PME currently supports one periodic graph')
+        lengths = np.linalg.norm(cell[0], axis=-1)
+        reciprocal = 2 * math.pi * np.linalg.inv(cell[0].T)
+        reciprocal_spacing = np.linalg.norm(reciprocal, axis=-1)
+        cutoff_shape = 2 * np.ceil(
+            self.kspace_cutoff / reciprocal_spacing
+        ).astype(int) + 2
+        spacing_shape = np.ceil(lengths / mesh_spacing).astype(int)
+        shape = np.maximum(cutoff_shape, spacing_shape)
+        shape = shape + shape % 2
+        return (
+            jnp.zeros(tuple(shape.tolist()), dtype=jnp.bool_),
+            jnp.zeros((assignment_order,), dtype=jnp.bool_),
+        )
+
+    def precompute_mesh(
+        self,
+        positions: jnp.ndarray,
+        batch: jnp.ndarray,
+        cell: jnp.ndarray,
+        mesh_template: jnp.ndarray,
+        assignment_template: jnp.ndarray,
+    ) -> dict[str, jnp.ndarray]:
+        """Build full reciprocal mesh and QM interpolation stencil."""
+        cell = cell.reshape(-1, 3, 3)
+        if cell.shape[0] != 1:
+            raise ValueError('Generalized PME currently supports one periodic graph')
+        grid_shape = mesh_template.shape
+        assignment_order = assignment_template.shape[0]
+        integer_axes = [jnp.fft.fftfreq(size) * size for size in grid_shape]
+        integer_grid = jnp.stack(
+            jnp.meshgrid(*integer_axes, indexing='ij'), axis=-1
+        )
+        reciprocal = 2 * math.pi * jnp.linalg.inv(cell[0].T)
+        k_vectors = integer_grid @ reciprocal
+        k_norm2 = jnp.sum(k_vectors * k_vectors, axis=-1)
+        k0_mask = k_norm2 == 0
+        cutoff_mask = (k_norm2 <= self.kspace_cutoff**2) & ~k0_mask
+        assignment_window = jnp.prod(
+            jnp.sinc(
+                integer_grid
+                / jnp.asarray(grid_shape, dtype=positions.dtype)
+            )
+            ** assignment_order,
+            axis=-1,
+        )
+        qm_indices, qm_weights = _mesh_indices_and_weights(
+            positions, cell[0], grid_shape, assignment_order
+        )
+        density_basis = self.density_basis(
+            k_vectors.reshape(-1, 3),
+            k_norm2.reshape(-1),
+            k0_mask.reshape(-1).astype(positions.dtype),
+        ).reshape(*grid_shape, -1, 2)
+        feature_basis = self.feature_basis(
+            k_vectors.reshape(-1, 3),
+            k_norm2.reshape(-1),
+            k0_mask.reshape(-1).astype(positions.dtype),
+        ).reshape(*grid_shape, len(self.feature_basis.widths), -1, 2)
+        return {
+            'mesh_template': mesh_template,
+            'assignment_template': assignment_template,
+            'grid_shape_array': jnp.asarray(grid_shape, dtype=jnp.int32),
+            'assignment_window': assignment_window,
+            'k_vectors_mesh': k_vectors,
+            'k_norm2_mesh': k_norm2,
+            'k0_mask_mesh': k0_mask,
+            'cutoff_mask_mesh': cutoff_mask,
+            'density_basis_mesh': density_basis,
+            'feature_basis_mesh': feature_basis,
+            'qm_mesh_indices': qm_indices,
+            'qm_mesh_weights': qm_weights,
+            'volume': jnp.abs(jnp.linalg.det(cell)),
+            'batch': batch,
+            'positions': positions,
+            'cell': cell,
+        }
+
+    @staticmethod
+    def _mesh_structure_factors(
+        positions: jnp.ndarray,
+        values: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        grid_shape = cache['mesh_template'].shape
+        order = cache['assignment_template'].shape[0]
+        indices, weights = _mesh_indices_and_weights(
+            positions, cache['cell'][0], grid_shape, order
+        )
+        mesh = _spread_to_mesh(values, indices, weights, grid_shape)
+        transformed = jnp.fft.fftn(mesh, axes=(0, 1, 2))
+        return transformed / cache['assignment_window'][..., None]
+
+    def _mesh_density(
+        self,
+        source_feats: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        coefficients = self._mesh_structure_factors(
+            cache['positions'], source_feats, cache
+        )
+        basis = cache['density_basis_mesh']
+        basis_complex = basis[..., 0] + 1j * basis[..., 1]
+        density = jnp.sum(basis_complex * coefficients, axis=-1)
+        return (2 * math.pi) ** 3 * density / cache['volume'][0]
+
+    def mesh_point_charge_density(
+        self,
+        positions: jnp.ndarray,
+        charges: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        coefficients = self._mesh_structure_factors(positions, charges, cache)[..., 0]
+        return (2 * math.pi) ** 3 * coefficients / cache['volume'][0]
+
+    def _mesh_project_density(
+        self,
+        density: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        inverse_k2 = jnp.where(
+            cache['cutoff_mask_mesh'],
+            1.0 / jnp.where(cache['k0_mask_mesh'], 1.0, cache['k_norm2_mesh']),
+            0.0,
+        )
+        potential = density * inverse_k2 * FIELD_CONSTANT
+        basis = cache['feature_basis_mesh']
+        basis_complex = basis[..., 0] + 1j * basis[..., 1]
+        spectral = jnp.conj(potential)[..., None, None] * basis_complex
+        spectral = spectral.reshape(*cache['mesh_template'].shape, -1)
+        # Spreading and gathering each apply the cardinal B-spline window.
+        # Dividing here removes the gathering window; the density construction
+        # above already removed the spreading window.
+        spatial = jnp.fft.fftn(
+            spectral / cache['assignment_window'][..., None],
+            axes=(0, 1, 2),
+        ).real / (2 * math.pi) ** 3
+        projected = _gather_from_mesh(
+            spatial, cache['qm_mesh_indices'], cache['qm_mesh_weights']
+        )
+        return projected[:, self.output_permutation]
+
+    def mesh_field_features(
+        self,
+        source_feats: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        features = self._mesh_project_density(
+            self._mesh_density(source_feats, cache), cache
+        )
+        if not self.include_field_self_interaction:
+            self_terms = (
+                _gather_self_terms(source_feats, self.field_self_index_tuple)
+                * self.field_self_values
+            )
+            self_terms = jnp.pad(
+                self_terms,
+                ((0, 0), (0, features.shape[-1] - self_terms.shape[-1])),
+            )
+            features = features - self_terms
+        return features
+
+    def mesh_point_charge_field_features(
+        self,
+        mm_density: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        return self._mesh_project_density(mm_density, cache)
+
+    def mesh_coulomb_energy(
+        self,
+        source_feats: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> jnp.ndarray:
+        density = self._mesh_density(source_feats, cache)
+        inverse_k2 = jnp.where(
+            cache['cutoff_mask_mesh'],
+            1.0 / jnp.where(cache['k0_mask_mesh'], 1.0, cache['k_norm2_mesh']),
+            0.0,
+        )
+        energy = (
+            0.5
+            * cache['volume'][0]
+            * FIELD_CONSTANT
+            * jnp.sum(jnp.abs(density) ** 2 * inverse_k2)
+            / (2 * math.pi) ** 6
+        )
+        if not self.include_energy_self_interaction:
+            self_terms = (
+                _gather_self_terms(source_feats, self.energy_self_index_tuple)
+                * self.energy_self_values
+            )
+            energy = energy - 0.5 * jnp.sum(
+                source_feats[:, : self_terms.shape[-1]] * self_terms
+            )
+        return jnp.asarray([energy])
+
+    def mesh_mixed_coulomb_energy(
+        self,
+        source_feats: jnp.ndarray,
+        mm_density: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        qm_density = self._mesh_density(source_feats, cache)
+        combined_density = qm_density + mm_density
+        inverse_k2 = jnp.where(
+            cache['cutoff_mask_mesh'],
+            1.0 / jnp.where(cache['k0_mask_mesh'], 1.0, cache['k_norm2_mesh']),
+            0.0,
+        )
+        prefactor = (
+            0.5 * cache['volume'][0] * FIELD_CONSTANT / (2 * math.pi) ** 6
+        )
+        combined = prefactor * jnp.sum(
+            jnp.abs(combined_density) ** 2 * inverse_k2
+        )
+        mm_only = prefactor * jnp.sum(jnp.abs(mm_density) ** 2 * inverse_k2)
+        qm_only = prefactor * jnp.sum(jnp.abs(qm_density) ** 2 * inverse_k2)
+        qm_and_cross = combined - mm_only
+        if not self.include_energy_self_interaction:
+            self_terms = (
+                _gather_self_terms(source_feats, self.energy_self_index_tuple)
+                * self.energy_self_values
+            )
+            qm_and_cross = qm_and_cross - 0.5 * jnp.sum(
+                source_feats[:, : self_terms.shape[-1]] * self_terms
+            )
+        return jnp.asarray([qm_and_cross]), jnp.asarray(
+            [combined - mm_only - qm_only]
+        )
+
+    def mesh_point_charge_ewald_reciprocal_energy(
+        self,
+        mm_density: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+        alpha: jnp.ndarray | float,
+    ) -> jnp.ndarray:
+        """Conventional point-charge Ewald reciprocal energy from the mesh."""
+        k2 = cache['k_norm2_mesh']
+        nonzero = ~cache['k0_mask_mesh']
+        kernel = jnp.where(
+            nonzero,
+            jnp.exp(-k2 / (4 * jnp.asarray(alpha) ** 2))
+            / jnp.where(nonzero, k2, 1.0),
+            0.0,
+        )
+        # Convert the normalized POLAR density back to the point-charge
+        # structure factor used by the conventional Ewald expression.
+        structure = mm_density * cache['volume'][0] / (2 * math.pi) ** 3
+        coulomb = FIELD_CONSTANT / (4 * math.pi)
+        return (
+            coulomb
+            * 2
+            * math.pi
+            / cache['volume'][0]
+            * jnp.sum(jnp.abs(structure) ** 2 * kernel)
+        )
+
+    def mesh_point_charge_ewald_cross_energy(
+        self,
+        first_density: jnp.ndarray,
+        second_density: jnp.ndarray,
+        cache: dict[str, jnp.ndarray],
+        alpha: jnp.ndarray | float,
+    ) -> jnp.ndarray:
+        """Conventional Ewald reciprocal cross energy for two charge sets."""
+        k2 = cache['k_norm2_mesh']
+        nonzero = ~cache['k0_mask_mesh']
+        alpha = jnp.asarray(alpha).reshape(())
+        kernel = jnp.where(
+            nonzero,
+            jnp.exp(-k2 / (4 * alpha**2)) / jnp.where(nonzero, k2, 1.0),
+            0.0,
+        )
+        normalization = cache['volume'][0] / (2 * math.pi) ** 3
+        first_structure = first_density * normalization
+        second_structure = second_density * normalization
+        coulomb = FIELD_CONSTANT / (4 * math.pi)
+        return (
+            coulomb
+            * 4
+            * math.pi
+            / cache['volume'][0]
+            * jnp.sum(
+                jnp.real(first_structure * jnp.conj(second_structure)) * kernel
+            )
+        )
 
     @staticmethod
     def _moments(

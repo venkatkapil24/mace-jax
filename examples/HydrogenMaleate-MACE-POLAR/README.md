@@ -29,4 +29,9 @@ MM real-space Coulomb and Lennard-Jones interactions use a JAX-MD neighbor
 list. The default nonbonded cutoff is the smaller of 9.0 Å and 49% of the box
 length (5.76 Å for this cell), with a 0.25 Å neighbor skin. Both are
 configurable with `--nonbonded-cutoff` and `--neighbor-skin`. The reciprocal
-Ewald calculation is unchanged.
+calculation defaults to generalized PME with a 0.5 Å mesh and eighth-order
+cardinal B-spline assignment. The same mesh carries every MACE Gaussian
+multipole channel, MM point charges, the restored MM Ewald term, and the
+fixed-charge mechanical-embedding cross term. `--reciprocal-method direct`
+retains the original explicit reciprocal-vector sum as an accuracy reference;
+`--pme-mesh-spacing` and `--pme-assignment-order` control the mesh.

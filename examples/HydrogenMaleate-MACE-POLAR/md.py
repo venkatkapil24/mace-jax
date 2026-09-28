@@ -219,13 +219,23 @@ def ordered_pairs_from_dense_neighbors(neighbor_index, n_atoms):
 
 def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
                  restraint_radius, restraint_k, mechanical_qm_charges=None,
-                 nonbonded_cutoff=9.0, neighbor_skin=0.25):
+                 nonbonded_cutoff=9.0, neighbor_skin=0.25,
+                 reciprocal_method='pme', pme_mesh_spacing=0.5,
+                 pme_assignment_order=8):
     box = float(atoms.cell[0, 0])
     n_qm = len(atoms) if mode_name == 'polar' else 11 + 3*qm_water_count
     qm_atoms = atoms[:n_qm]
     box, periodic_mode, data, graphdef, params, neighbor_fn, shift_fn = (
-        initialize_model(qm_atoms, bundle)
+        initialize_model(
+            qm_atoms,
+            bundle,
+            generalized_pme=reciprocal_method == 'pme',
+            pme_mesh_spacing=pme_mesh_spacing,
+            pme_assignment_order=pme_assignment_order,
+        )
     )
+    if reciprocal_method not in ('direct', 'pme'):
+        raise ValueError("reciprocal_method must be 'direct' or 'pme'")
     if mode_name != 'polar' and (len(atoms) - n_qm) % 3:
         raise ValueError('MM region must contain complete water triplets')
     mm_count = (len(atoms) - n_qm) // 3
@@ -274,7 +284,7 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
             neighbor_fn, nonbonded_neighbor_fn, n_qm
         )
 
-    def mm_internal_terms(mm_r):
+    def mm_internal_terms(mm_r, reciprocal):
         waters = mm_r.reshape(-1, 3, 3)
         oh1 = minimum_image(waters[:, 1] - waters[:, 0], box)
         oh2 = minimum_image(waters[:, 2] - waters[:, 0], box)
@@ -283,9 +293,6 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         angle = jnp.arccos(jnp.clip(cosine, -1+1e-12, 1-1e-12))
         bonded = 0.5*OH_K*jnp.sum((r1-OH_R0)**2 + (r2-OH_R0)**2)
         bonded += 0.5*HOH_K*jnp.sum((angle-HOH_THETA0)**2)
-        phase = k_vectors @ mm_r.T
-        c, s = jnp.cos(phase) @ mm_charges, jnp.sin(phase) @ mm_charges
-        reciprocal = COULOMB*2*math.pi/box**3*jnp.sum(k_weights*(c*c+s*s))
         self_energy = -COULOMB*alpha/math.sqrt(math.pi)*jnp.sum(mm_charges**2)
         background = ewald_neutralizing_background_energy(
             jnp.sum(mm_charges), box**3, alpha
@@ -298,18 +305,8 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         )
         return bonded + reciprocal + self_energy + background + exceptions
 
-    def mechanical_cross_electrostatics(qm_r, mm_r):
+    def mechanical_cross_electrostatics(qm_r, mm_r, reciprocal):
         """Fixed-charge QM--MM Ewald cross term used by mechanical embedding."""
-        qm_phase = k_vectors @ qm_r.T
-        mm_phase = k_vectors @ mm_r.T
-        qm_c = jnp.cos(qm_phase) @ mechanical_qm_charges
-        qm_s = jnp.sin(qm_phase) @ mechanical_qm_charges
-        mm_c = jnp.cos(mm_phase) @ mm_charges
-        mm_s = jnp.sin(mm_phase) @ mm_charges
-        reciprocal = (
-            COULOMB * 4 * math.pi / box**3
-            * jnp.sum(k_weights * (qm_c * mm_c + qm_s * mm_s))
-        )
         q_qm = jnp.sum(mechanical_qm_charges)
         q_mm = jnp.sum(mm_charges)
         background = (
@@ -338,14 +335,43 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
             data, positions=qm_r, edge_index=edge_index,
             shifts=shifts, unit_shifts=unit_shifts,
         )
-        if mode_name == 'mlmm':
+        if mode_name == 'mlmm' or (
+            mode_name == 'mechanical' and reciprocal_method == 'pme'
+        ):
             inputs['mm_positions'] = r[n_qm:]
             inputs['mm_charges'] = mm_charges
-        polar_energy = nnx.merge(graphdef, model_params)(
+            inputs['mm_ewald_alpha'] = jnp.asarray(alpha, dtype=r.dtype)
+        if mode_name == 'mechanical' and reciprocal_method == 'pme':
+            inputs['mechanical_qm_charges'] = mechanical_qm_charges
+        model_result = nnx.merge(graphdef, model_params)(
             inputs, compute_force=False, pbc_handling=periodic_mode
-        )['energy'][0]
+        )
+        polar_energy = model_result['energy'][0]
         if mode_name == 'polar':
             return polar_energy
+        if reciprocal_method == 'pme':
+            mm_reciprocal = model_result['mm_ewald_reciprocal_energy'][0]
+            mechanical_reciprocal = model_result[
+                'mechanical_ewald_cross_energy'
+            ][0]
+        else:
+            mm_r = r[n_qm:]
+            phase = k_vectors @ mm_r.T
+            c = jnp.cos(phase) @ mm_charges
+            s = jnp.sin(phase) @ mm_charges
+            mm_reciprocal = (
+                COULOMB * 2 * math.pi / box**3
+                * jnp.sum(k_weights * (c*c + s*s))
+            )
+            mechanical_reciprocal = jnp.asarray(0.0, dtype=r.dtype)
+            if mode_name == 'mechanical':
+                qm_phase = k_vectors @ qm_r.T
+                qm_c = jnp.cos(qm_phase) @ mechanical_qm_charges
+                qm_s = jnp.sin(qm_phase) @ mechanical_qm_charges
+                mechanical_reciprocal = (
+                    COULOMB * 4 * math.pi / box**3
+                    * jnp.sum(k_weights * (qm_c*c + qm_s*s))
+                )
         mm_real, mm_lj, cross_lj, mechanical_real = sparse_nonbonded_terms(
             r,
             ordered_pairs_from_dense_neighbors(
@@ -362,7 +388,7 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         )
         energy = (
             polar_energy
-            + mm_internal_terms(r[n_qm:])
+            + mm_internal_terms(r[n_qm:], mm_reciprocal)
             + mm_real
             + mm_lj
             + cross_lj
@@ -370,7 +396,7 @@ def build_energy(atoms, bundle, mode_name, alpha, kmax, qm_water_count,
         )
         if mode_name == 'mechanical':
             energy += mechanical_real + mechanical_cross_electrostatics(
-                qm_r, r[n_qm:]
+                qm_r, r[n_qm:], mechanical_reciprocal
             )
         return energy
 
@@ -437,6 +463,11 @@ def main():
     parser.add_argument('--report-interval', type=int, default=200)
     parser.add_argument('--ewald-alpha', type=float, default=0.5)
     parser.add_argument('--ewald-kmax', type=int, default=6)
+    parser.add_argument(
+        '--reciprocal-method', choices=['pme', 'direct'], default='pme'
+    )
+    parser.add_argument('--pme-mesh-spacing', type=float, default=0.5)
+    parser.add_argument('--pme-assignment-order', type=int, default=8)
     parser.add_argument('--nonbonded-cutoff', type=float)
     parser.add_argument('--neighbor-skin', type=float, default=0.25)
     parser.add_argument('--qm-water-count', type=int, default=0)
@@ -477,6 +508,8 @@ def main():
         atoms, args.bundle, args.mode, args.ewald_alpha, args.ewald_kmax,
         args.qm_water_count, args.restraint_radius, args.restraint_k,
         mechanical_qm_charges, args.nonbonded_cutoff, args.neighbor_skin,
+        args.reciprocal_method, args.pme_mesh_spacing,
+        args.pme_assignment_order,
     )
     checkpoint = args.output / 'checkpoint.npz'
     if checkpoint.exists():
@@ -548,6 +581,13 @@ def main():
             ),
             'neighbor_skin_angstrom': (
                 args.neighbor_skin if args.mode != 'polar' else None
+            ),
+            'reciprocal_method': args.reciprocal_method,
+            'pme_mesh_spacing_angstrom': (
+                args.pme_mesh_spacing if args.reciprocal_method == 'pme' else None
+            ),
+            'pme_assignment_order': (
+                args.pme_assignment_order if args.reciprocal_method == 'pme' else None
             ),
             'mechanical_qm_charges': (
                 str(args.mechanical_qm_charges) if args.mode == 'mechanical' else None

@@ -9,6 +9,7 @@ from graph_longrange.energy import GTOElectrostaticEnergy
 from graph_longrange.features import GTOElectrostaticFeatures
 from graph_longrange.kspace import compute_k_vectors_flat
 
+from mace_jax.modules.polar_electrostatics import FIELD_CONSTANT
 from mace_jax.modules.polar_periodic import PeriodicPolarElectrostatics
 
 
@@ -289,3 +290,144 @@ def test_mixed_periodic_batch_matches_torch():
     np.testing.assert_allclose(
         np.asarray(actual_energy), expected_energy, atol=1e-8, rtol=1e-8
     )
+
+
+def test_generalized_pme_matches_direct_gaussian_multipoles_and_jit():
+    jax.config.update('jax_enable_x64', True)
+    model = PeriodicPolarElectrostatics(1, 1.5, 1, (1.5, 3.0))
+    positions = jnp.asarray(
+        [[0.3, 0.5, 0.8], [1.4, 1.2, 1.7], [2.0, 0.8, 2.4]]
+    )
+    density = jnp.asarray(
+        [[0.4, -0.1, 0.2, 0.3], [-0.3, 0.2, 0.1, -0.1], [0.2, 0.1, -0.2, 0.1]]
+    )
+    cell = jnp.diag(jnp.asarray([7.0, 8.0, 9.0]))[None]
+    batch = jnp.zeros(positions.shape[0], dtype=jnp.int32)
+    mesh_template, assignment_template = model.prepare_mesh_template(
+        cell, mesh_spacing=0.4, assignment_order=8
+    )
+
+    def mesh_outputs(pos):
+        cache = model.precompute_mesh(
+            pos, batch, cell, mesh_template, assignment_template
+        )
+        return (
+            model.mesh_coulomb_energy(density, cache),
+            model.mesh_field_features(density, cache),
+        )
+
+    direct_cache = model.precompute(positions, batch, cell)
+    direct_energy = model.coulomb_energy(density, direct_cache)
+    direct_field = model.field_features(density, direct_cache)
+    mesh_energy, mesh_field = jax.jit(mesh_outputs)(positions)
+    np.testing.assert_allclose(mesh_energy, direct_energy, atol=2e-9, rtol=2e-9)
+    np.testing.assert_allclose(mesh_field, direct_field, atol=2e-9, rtol=2e-9)
+
+    direct_gradient = jax.grad(
+        lambda pos: model.coulomb_energy(
+            density, model.precompute(pos, batch, cell)
+        ).sum()
+    )(positions)
+    mesh_gradient = jax.jit(jax.grad(lambda pos: mesh_outputs(pos)[0].sum()))(
+        positions
+    )
+    np.testing.assert_allclose(
+        mesh_gradient, direct_gradient, atol=2e-8, rtol=2e-8
+    )
+
+
+def test_generalized_pme_matches_direct_point_charge_embedding_and_ewald():
+    jax.config.update('jax_enable_x64', True)
+    model = PeriodicPolarElectrostatics(1, 1.5, 1, (1.5, 3.0))
+    positions = jnp.asarray([[0.3, 0.5, 0.8], [1.4, 1.2, 1.7]])
+    density = jnp.asarray([[0.4, -0.1, 0.2, 0.3], [-0.3, 0.2, 0.1, -0.1]])
+    mm_positions = jnp.asarray([[2.3, 1.5, 0.7], [3.1, 2.2, 1.9], [2.8, 3.0, 2.4]])
+    mm_charges = jnp.asarray([-0.834, 0.417, 0.417])
+    qm_point_charges = jnp.asarray([-0.7, -0.3])
+    cell = jnp.diag(jnp.asarray([7.0, 8.0, 9.0]))[None]
+    batch = jnp.zeros(positions.shape[0], dtype=jnp.int32)
+    direct_cache = model.precompute(positions, batch, cell)
+    mesh_template, assignment_template = model.prepare_mesh_template(
+        cell, mesh_spacing=0.4, assignment_order=8
+    )
+    mesh_cache = model.precompute_mesh(
+        positions, batch, cell, mesh_template, assignment_template
+    )
+    mm_density = model.mesh_point_charge_density(
+        mm_positions, mm_charges, mesh_cache
+    )
+
+    direct_field = model.point_charge_field_features(
+        mm_positions, mm_charges, direct_cache
+    )
+    direct_mixed, direct_cross = model.mixed_coulomb_energy(
+        density, mm_positions, mm_charges, direct_cache
+    )
+    mesh_field = model.mesh_point_charge_field_features(mm_density, mesh_cache)
+    mesh_mixed, mesh_cross = model.mesh_mixed_coulomb_energy(
+        density, mm_density, mesh_cache
+    )
+    np.testing.assert_allclose(mesh_field, direct_field, atol=3e-8, rtol=3e-8)
+    np.testing.assert_allclose(mesh_mixed, direct_mixed, atol=2e-9, rtol=2e-9)
+    np.testing.assert_allclose(mesh_cross, direct_cross, atol=2e-9, rtol=2e-9)
+
+    alpha = jnp.asarray(0.5)
+    k_vectors = mesh_cache['k_vectors_mesh']
+    k2 = mesh_cache['k_norm2_mesh']
+    nonzero = k2 > 0
+    kernel = jnp.where(nonzero, jnp.exp(-k2 / (4 * alpha**2)) / k2, 0.0)
+    mm_phase = jnp.einsum('...d,nd->...n', k_vectors, mm_positions)
+    qm_phase = jnp.einsum('...d,nd->...n', k_vectors, positions)
+    mm_structure = jnp.sum(mm_charges * jnp.exp(-1j * mm_phase), axis=-1)
+    qm_structure = jnp.sum(qm_point_charges * jnp.exp(-1j * qm_phase), axis=-1)
+    volume = jnp.linalg.det(cell[0])
+    coulomb = FIELD_CONSTANT / (4 * np.pi)
+    direct_mm_ewald = (
+        coulomb * 2 * np.pi / volume
+        * jnp.sum(jnp.abs(mm_structure) ** 2 * kernel)
+    )
+    direct_cross_ewald = (
+        coulomb * 4 * np.pi / volume
+        * jnp.sum(jnp.real(qm_structure * jnp.conj(mm_structure)) * kernel)
+    )
+    mesh_mm_ewald = model.mesh_point_charge_ewald_reciprocal_energy(
+        mm_density, mesh_cache, alpha
+    )
+    qm_density = model.mesh_point_charge_density(
+        positions, qm_point_charges, mesh_cache
+    )
+    mesh_cross_ewald = model.mesh_point_charge_ewald_cross_energy(
+        qm_density, mm_density, mesh_cache, alpha
+    )
+    np.testing.assert_allclose(
+        mesh_mm_ewald, direct_mm_ewald, atol=3e-8, rtol=3e-8
+    )
+    np.testing.assert_allclose(
+        mesh_cross_ewald, direct_cross_ewald, atol=3e-8, rtol=3e-8
+    )
+
+    def direct_mixed_energy(qm_pos, mm_pos):
+        cache = model.precompute(qm_pos, batch, cell)
+        return model.mixed_coulomb_energy(
+            density, mm_pos, mm_charges, cache
+        )[0].sum()
+
+    def mesh_mixed_energy(qm_pos, mm_pos):
+        cache = model.precompute_mesh(
+            qm_pos, batch, cell, mesh_template, assignment_template
+        )
+        current_mm_density = model.mesh_point_charge_density(
+            mm_pos, mm_charges, cache
+        )
+        return model.mesh_mixed_coulomb_energy(
+            density, current_mm_density, cache
+        )[0].sum()
+
+    direct_gradients = jax.grad(direct_mixed_energy, argnums=(0, 1))(
+        positions, mm_positions
+    )
+    mesh_gradients = jax.jit(jax.grad(mesh_mixed_energy, argnums=(0, 1)))(
+        positions, mm_positions
+    )
+    for actual, expected in zip(mesh_gradients, direct_gradients, strict=True):
+        np.testing.assert_allclose(actual, expected, atol=2e-7, rtol=2e-7)
