@@ -791,3 +791,14 @@ If you have any questions, please contact us at ilyes.batatia@ens-paris-saclay.f
 ## License
 
 MACE is published and distributed under the [MIT](MIT.md).
+
+## OpenMM mechanical embedding compatibility
+
+The hydrogen maleate drivers share physical parameters and support an OpenMM
+compatibility profile with separate point-charge PME, periodic image graphs,
+and Langevin-middle dynamics. The generalized electrostatic embedding path
+remains available. See [settings and verification](examples/HydrogenMaleate-MACE-POLAR/OPENMM_COMPATIBILITY.md).
+
+For higher numerical accuracy using the existing generalized mesh solver, use
+`--compatibility-profile generalized-accurate`. See the [settings and measured
+force errors](examples/HydrogenMaleate-MACE-POLAR/GENERALIZED_ACCURACY.md).

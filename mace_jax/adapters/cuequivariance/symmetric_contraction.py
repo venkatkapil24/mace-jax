@@ -308,7 +308,7 @@ class SymmetricContraction(nnx.Module):
             self.descriptor,
             [weight_rep, x_rep],
             math_dtype=dtype,
-            method='naive',
+            method='uniform_1d' if jax.default_backend() == 'gpu' else 'naive',
         )
 
         out_ir_mul = out_rep.change_layout(cue.ir_mul).array

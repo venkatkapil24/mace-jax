@@ -8,6 +8,7 @@ import numpy as np
 from flax import nnx
 from jax_md import partition, space
 
+from mace_jax.modules.periodic_graph import ImageGraphNeighborFns
 from mace_jax.tools.bundle import load_model_bundle
 
 
@@ -44,10 +45,18 @@ def graph_edges(positions, neighbors, box):
     sender = jnp.where(valid, sender, 0).astype(jnp.int32)
     receiver = jnp.where(valid, receiver, 0).astype(jnp.int32)
     delta = positions[receiver] - positions[sender]
-    unit = -jnp.round(delta / box)
+    unit = (
+        neighbors.unit_shifts
+        if hasattr(neighbors, 'unit_shifts')
+        else -jnp.round(delta / box)
+    )
     shifts = unit * box
-    shifts = jnp.where(valid[:, None], shifts, jnp.array([box, 0.0, 0.0]))
-    unit = jnp.where(valid[:, None], unit, jnp.array([1.0, 0.0, 0.0]))
+    padding_unit = (
+        2 + jnp.max(jnp.abs(unit)) if hasattr(neighbors, 'unit_shifts') else 1.0
+    )
+    padding = jnp.asarray([1.0, 0.0, 0.0]) * padding_unit
+    shifts = jnp.where(valid[:, None], shifts, padding * box)
+    unit = jnp.where(valid[:, None], unit, padding)
     return jnp.stack((sender, receiver)), shifts, unit
 
 
@@ -85,4 +94,8 @@ def initialize_model(
         capacity_multiplier=capacity_multiplier,
         format=partition.Sparse,
     )
+    if float(bundle.config['r_max']) > box / 2:
+        neighbor_fn = ImageGraphNeighborFns(
+            neighbor_fn, box, float(bundle.config['r_max']), capacity_multiplier
+        )
     return box, mode, data, graphdef, params, neighbor_fn, shift
