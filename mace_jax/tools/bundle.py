@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import pickle
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from e3nn_jax import Irrep, Irreps
 from flax import nnx, serialization
@@ -26,6 +27,27 @@ class ModelBundle:
     config: dict
     params: dict
     graphdef: object
+
+    def make_frozen_apply(self) -> Callable:
+        """Bind a snapshot of the weights for inference inside a compiled loop.
+
+        The returned ``apply(data, **kwargs)`` has the model's call interface
+        without a parameter argument. JIT compilation can then precompute
+        weight-only operations. Coordinates and cell remain runtime inputs.
+        Create a new callable to use updated weights; training should keep
+        passing parameters explicitly. This method does not compile a loop.
+        """
+        parameters = jax.tree.map(
+            lambda value: jnp.array(value, copy=True)
+            if isinstance(value, (np.ndarray, np.generic)) else value,
+            self.params,
+        )
+        graphdef = self.graphdef
+
+        def apply(data, **kwargs):
+            return nnx.merge(graphdef, parameters)(data, **kwargs)
+
+        return apply
 
 
 def _restore_serialized_state(template: dict, payload: bytes) -> dict:

@@ -159,7 +159,14 @@ class SparseUvuTensorProduct(nnx.Module):
             if mode == 'dot':
                 second = x2[:, slice2].reshape(batch, mul2, dim1)
                 mixed = jnp.einsum('uv,bvd->bud', weights, second)
-                contribution = jnp.sum(first * mixed, axis=-1) / math.sqrt(dim1)
+                # A fused reduction followed by concatenation miscompiles on
+                # JAX/jaxlib 0.10.2 GPU. Sum the small irrep explicitly so the
+                # same contraction stays correct without global compiler flags.
+                product = first * mixed
+                contribution = product[..., 0]
+                for component in range(1, dim1):
+                    contribution = contribution + product[..., component]
+                contribution = contribution / math.sqrt(dim1)
             else:
                 second = x2[:, slice2].reshape(batch, mul2)
                 mixed = jnp.einsum('bv,uv->bu', second, weights)

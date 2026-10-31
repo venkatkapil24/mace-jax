@@ -519,8 +519,15 @@ class _RadialSequential(nnx.Module):
                 layer_idx += 1
 
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
+        return self._apply_layers(inputs)
+
+    def _apply_layers(
+        self, inputs: jnp.ndarray, *, start: int = 0, stop: int | None = None,
+    ) -> jnp.ndarray:
         x = inputs
-        for order_index, (kind, key) in enumerate(self._layer_order):
+        for order_index, (kind, key) in enumerate(
+            self._layer_order[start:stop], start=start
+        ):
             if kind == 'act':
                 x = jax.nn.silu(x)
                 continue
@@ -565,3 +572,76 @@ class RadialMLP(nnx.Module):
 
     def __call__(self, inputs: jnp.ndarray) -> jnp.ndarray:
         return self.net(inputs)
+
+    def with_node_embeddings(
+        self,
+        edge_feats: jnp.ndarray,
+        source_embedding: jnp.ndarray,
+        target_embedding: jnp.ndarray,
+        edge_index: jnp.ndarray,
+        *,
+        output_scale: jnp.ndarray | None = None,
+    ) -> jnp.ndarray:
+        """Evaluate concatenated edge/node inputs without repeating node projections.
+
+        This equals applying the MLP to ``[edge_feats, source[sender],
+        target[receiver]]``. Only the first affine map is factored; all
+        subsequent normalization and nonlinear operations are unchanged.
+        Other precisions retain the original map because reduced-precision
+        matrix products can round differently after factoring.
+
+        ``output_scale`` is a scalar or one scalar per edge with shape
+        ``(n_edges, 1)``. In float64 it is folded into the final affine map
+        to avoid retaining an additional unscaled edge-weight array.
+        """
+        if output_scale is not None:
+            output_scale = jnp.broadcast_to(output_scale, (edge_feats.shape[0], 1))
+        first = self.net.layers['0']
+        if any(value.dtype != jnp.float64 for value in (
+            edge_feats, source_embedding, target_embedding, first.kernel,
+        )) or (first.dtype is not None and first.dtype != jnp.float64):
+            output = self(jnp.concatenate(
+                (edge_feats, source_embedding[edge_index[0]],
+                 target_embedding[edge_index[1]]), axis=-1,
+            ))
+            return output if output_scale is None else output * output_scale
+        kernel, bias = first.kernel, first.bias
+        if len(self.net._layer_order) == 1 and self.output_permutation is not None:
+            permutation = jnp.asarray(self.output_permutation)
+            kernel = jnp.take(kernel, permutation, axis=-1)
+            if bias is not None:
+                bias = jnp.take(bias, permutation, axis=-1)
+        edge_dim = edge_feats.shape[-1]
+        source_end = edge_dim + source_embedding.shape[-1]
+        projected = jnp.matmul(edge_feats, kernel[:edge_dim], precision=first.precision)
+        projected = projected + jnp.matmul(
+            source_embedding, kernel[edge_dim:source_end], precision=first.precision,
+        )[
+            edge_index[0]
+        ]
+        projected = projected + jnp.matmul(
+            target_embedding, kernel[source_end:], precision=first.precision,
+        )[
+            edge_index[1]
+        ]
+        if bias is not None:
+            projected = projected + bias
+        if output_scale is None or len(self.net._layer_order) == 1:
+            output = self.net._apply_layers(projected, start=1)
+            return output if output_scale is None else output * output_scale
+        last = self.net.layers[self.net._layer_order[-1][1]]
+        if last.kernel.dtype != jnp.float64 or (
+            last.dtype is not None and last.dtype != jnp.float64
+        ):
+            return self.net._apply_layers(projected, start=1) * output_scale
+        hidden = self.net._apply_layers(projected, start=1, stop=-1)
+        kernel, bias = last.kernel, last.bias
+        if self.output_permutation is not None:
+            permutation = jnp.asarray(self.output_permutation)
+            kernel = jnp.take(kernel, permutation, axis=-1)
+            if bias is not None:
+                bias = jnp.take(bias, permutation, axis=-1)
+        output = jnp.matmul(hidden * output_scale, kernel, precision=last.precision)
+        if bias is not None:
+            output = output + bias * output_scale
+        return output

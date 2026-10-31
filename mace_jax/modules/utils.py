@@ -113,7 +113,9 @@ def get_outputs(
     data: dict[str, jnp.ndarray],
     compute_force: bool = True,
     compute_stress: bool = False,
-) -> Outputs:
+    *,
+    has_aux: bool = False,
+) -> Outputs | tuple[Outputs, Any]:
     """
     Evaluate per-graph energies together with optional forces and stress tensors.
 
@@ -134,6 +136,9 @@ def get_outputs(
             boolean scalar.
         compute_stress: Whether to return stresses. As above, can be Python or
             traced.
+        has_aux: Whether energy_fn returns (energies, auxiliary outputs).
+            If true, return (Outputs, auxiliary outputs) from the same forward
+            evaluation used to differentiate the energy.
 
     Returns:
         An `Outputs` tuple where:
@@ -143,6 +148,7 @@ def get_outputs(
             * `force_mask` / `stress_mask` indicate availability; when the input
               flags were traced these masks are JAX booleans aligned with the
               returned arrays.
+        With has_aux=True, returns (Outputs, auxiliary outputs) instead.
     """
     positions = data['positions']
     cell = data['cell']
@@ -152,6 +158,14 @@ def get_outputs(
     num_graphs = int(jnp.size(data['ptr']) - 1)
 
     displacement = jnp.zeros((num_graphs, 3, 3), dtype=positions.dtype)
+
+    def evaluate(*args, **kwargs):
+        value = energy_fn(*args, **kwargs)
+        return value if has_aux else (value, None)
+
+    def package(energy, forces, stress, force_mask, stress_mask, aux):
+        outputs = Outputs(energy, forces, stress, force_mask, stress_mask)
+        return (outputs, aux) if has_aux else outputs
 
     # Helper closures
     def energy_displacement_fn(pos, disp):
@@ -169,22 +183,22 @@ def get_outputs(
             unit_shifts,
             cell_reshaped[batch[edge_index[0]]],
         )
-        per_graph_energy = energy_fn(
+        per_graph_energy, aux = evaluate(
             deformed_positions, shifts=shifts, cell=cell_reshaped
         )
-        return jnp.sum(per_graph_energy), per_graph_energy
+        return jnp.sum(per_graph_energy), (per_graph_energy, aux)
 
     def energy_sum_fn(pos):
         """Return (total energy, per-graph energy) for the un-deformed geometry."""
-        per_graph_energy = energy_fn(pos)
-        return jnp.sum(per_graph_energy), per_graph_energy
+        per_graph_energy, aux = evaluate(pos)
+        return jnp.sum(per_graph_energy), (per_graph_energy, aux)
 
     def _ensure_energy(value: jnp.ndarray) -> jnp.ndarray:
         return jnp.atleast_1d(jnp.asarray(value))
 
-    def _compute_stress_raw() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    def _compute_stress_raw() -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, Any]:
         """Gradient-based computation of (energy, forces, stress) for stress path."""
-        (_, per_graph_energy), (grad_pos, grad_disp) = jax.value_and_grad(
+        (_, (per_graph_energy, aux)), (grad_pos, grad_disp) = jax.value_and_grad(
             energy_displacement_fn,
             argnums=(0, 1),
             has_aux=True,
@@ -200,21 +214,22 @@ def get_outputs(
             jnp.zeros_like(stress),
         )
         total_energy = _ensure_energy(per_graph_energy)
-        return total_energy, forces, stress
+        return total_energy, forces, stress, aux
 
-    def _compute_force_raw() -> tuple[jnp.ndarray, jnp.ndarray]:
+    def _compute_force_raw() -> tuple[jnp.ndarray, jnp.ndarray, Any]:
         """Gradient-based computation of (energy, forces) for the force-only path."""
-        (_, per_graph_energy), grad_pos = jax.value_and_grad(
+        (_, (per_graph_energy, aux)), grad_pos = jax.value_and_grad(
             energy_sum_fn,
             has_aux=True,
         )(positions)
         forces = -grad_pos
         total_energy = _ensure_energy(per_graph_energy)
-        return total_energy, forces
+        return total_energy, forces, aux
 
-    def _compute_energy_raw() -> jnp.ndarray:
+    def _compute_energy_raw() -> tuple[jnp.ndarray, Any]:
         """Energy-only evaluation used when no derivatives are requested."""
-        return _ensure_energy(energy_fn(positions))
+        energy, aux = evaluate(positions)
+        return _ensure_energy(energy), aux
 
     def _coerce_flag(flag):
         """Return `(flag_value, is_traced)` for Python bools and traced JAX values."""
@@ -228,13 +243,13 @@ def get_outputs(
 
     if not (force_traced or stress_traced):
         if stress_flag:
-            total_energy, forces, stress = _compute_stress_raw()
-            return Outputs(total_energy, forces, stress, True, True)
+            total_energy, forces, stress, aux = _compute_stress_raw()
+            return package(total_energy, forces, stress, True, True, aux)
         if force_flag:
-            total_energy, forces = _compute_force_raw()
-            return Outputs(total_energy, forces, None, True, False)
-        total_energy = _compute_energy_raw()
-        return Outputs(total_energy, None, None, False, False)
+            total_energy, forces, aux = _compute_force_raw()
+            return package(total_energy, forces, None, True, False, aux)
+        total_energy, aux = _compute_energy_raw()
+        return package(total_energy, None, None, False, False, aux)
 
     compute_force_mask = jnp.asarray(compute_force, dtype=bool)
     compute_stress_mask = jnp.asarray(compute_stress, dtype=bool)
@@ -245,17 +260,17 @@ def get_outputs(
     false_scalar = jnp.asarray(False, dtype=bool)
 
     def _stress_branch(_):
-        total_energy, forces, stress = _compute_stress_raw()
-        return Outputs(total_energy, forces, stress, true_scalar, true_scalar)
+        total_energy, forces, stress, aux = _compute_stress_raw()
+        return package(total_energy, forces, stress, true_scalar, true_scalar, aux)
 
     def _force_branch(_):
-        total_energy, forces = _compute_force_raw()
-        return Outputs(total_energy, forces, zero_stress, true_scalar, false_scalar)
+        total_energy, forces, aux = _compute_force_raw()
+        return package(total_energy, forces, zero_stress, true_scalar, false_scalar, aux)
 
     def _energy_only_branch(_):
-        total_energy = _compute_energy_raw()
-        return Outputs(
-            total_energy, zero_forces, zero_stress, false_scalar, false_scalar
+        total_energy, aux = _compute_energy_raw()
+        return package(
+            total_energy, zero_forces, zero_stress, false_scalar, false_scalar, aux
         )
 
     # lazily route traced flags through the right derivative path so only the
@@ -365,7 +380,7 @@ def prepare_graph(
             interaction_kwargs=ikw,
         )
 
-    positions = jnp.asarray(data['positions'], dtype=default_dtype())
+    positions = jnp.asarray(data['positions'])
     cell = jnp.asarray(data['cell'], dtype=positions.dtype)
     shifts = jnp.asarray(data['shifts'], dtype=positions.dtype)
     edge_index = jnp.asarray(data['edge_index'], dtype=jnp.int32)
@@ -410,23 +425,13 @@ def add_output_interface(cls=None):
             compute_stress: bool = False,
             **model_kwargs,
         ) -> dict[str, jnp.ndarray | None]:
-            raw_out = self._energy_fn(
-                data,
-                **model_kwargs,
-            )
-
-            energy_arr = raw_out['energy'] if isinstance(raw_out, dict) else raw_out
-
-            # The energy-only path already has every model output in raw_out.
-            # Calling get_outputs would evaluate _energy_fn a second time only
-            # to recover the same energy. Pure computations normally hide this
-            # duplication through dead-code elimination, while side-effectful
-            # feature communication must execute both evaluations.
             try:
                 energy_only = not bool(compute_force) and not bool(compute_stress)
             except TracerBoolConversionError:
                 energy_only = False
             if energy_only:
+                raw_out = self._energy_fn(data, **model_kwargs)
+                energy_arr = raw_out['energy'] if isinstance(raw_out, dict) else raw_out
                 result = (
                     dict(raw_out)
                     if isinstance(raw_out, dict)
@@ -456,17 +461,20 @@ def add_output_interface(cls=None):
                     new_data,
                     **model_kwargs,
                 )
-                return out['energy'] if isinstance(out, dict) else out
+                energy = out['energy'] if isinstance(out, dict) else out
+                return energy, out
 
-            total_energy, forces, stress, has_force, has_stress = get_outputs(
+            outputs, raw_out = get_outputs(
                 energy_fn=energy_fn,
                 data=data,
                 compute_force=compute_force,
                 compute_stress=compute_stress,
+                has_aux=True,
             )
+            total_energy, forces, stress, has_force, has_stress = outputs
 
             result = (
-                dict(raw_out) if isinstance(raw_out, dict) else {'energy': energy_arr}
+                dict(raw_out) if isinstance(raw_out, dict) else {'energy': total_energy}
             )
             try:
                 force_flag = bool(has_force)

@@ -422,6 +422,11 @@ def _select_weights(
     """
     selector = jnp.asarray(selector)
     if selector.ndim == 1:
+        if not isinstance(selector, jax.core.Tracer):
+            fixed = np.asarray(selector, dtype=np.int32)
+            if np.any(fixed < 0) or np.any(fixed >= num_elements):
+                raise ValueError('indices out of range for the available elements')
+            return weight_flat[jnp.asarray(fixed)]
         idx = selector.astype(jnp.int32)
         invalid = jnp.any(idx < 0) | jnp.any(idx >= num_elements)
 

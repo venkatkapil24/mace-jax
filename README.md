@@ -163,6 +163,47 @@ predict = jax.jit(
 outputs = predict(state, prepared_data)
 ```
 
+For fixed-weight inference with a loaded `ModelBundle`, bind its parameter
+snapshot before compiling the calculation:
+
+```python
+apply = bundle.make_frozen_apply()
+predict = jax.jit(lambda inputs: apply(
+    inputs, compute_force=True, compute_stress=True, pbc_handling=mode,
+))
+outputs = predict(prepared_data)
+```
+
+This lets the compiler precompute weight-only operations. The callable can
+also be used inside a compiled neighbor-list/MD loop; coordinates and the cell
+remain runtime inputs. Create a new callable after changing the weights.
+Training and calculations with changing parameters should retain the explicit
+parameter argument shown in the first example.
+
+The small irrep contractions sum their components explicitly. This avoids a
+JAX/jaxlib 0.10.2 GPU compiler defect when a reduction is fused with a downstream
+concatenation; the defect also reproduces in pure JAX without cuEquivariance.
+The contraction is mathematically unchanged. No response optimization barrier
+or CUDA command-buffer disabling flag is needed with this correction. A focused
+regression checks compiled values and analytic derivatives against NumPy.
+The model output interface uses one forward evaluation with auxiliary
+outputs passed through `jax.value_and_grad`; selecting only energy and forces
+does not require an additional model evaluation.
+
+For float64 nonlinear interactions, the first radial-network projection is
+split into edge and atom contributions. Atom-type contributions are projected
+once per atom and then gathered for its edges, rather than repeating the same
+wide projection for every neighbour. The checkpoint parameters and subsequent
+normalization/nonlinear layers are unchanged. Other precisions retain the
+original concatenated projection to preserve their rounding behavior.
+
+In the same float64 path, a scalar cutoff per edge is folded into the last
+affine projection: `(hidden @ weight + bias) * cutoff` becomes
+`(hidden * cutoff) @ weight + bias * cutoff`. This avoids retaining a second
+wide edge-weight array during differentiation. The checkpoint and mathematical
+function are unchanged, with differences at floating-point roundoff; other
+precisions keep scaling after the projection.
+
 `prepare_jit_data` uses the reference cell to choose a fixed set of integer
 reciprocal indices; the compiled calculation still uses the live cell for
 reciprocal vectors, energy, forces, and stress. Reprepare the indices if the
