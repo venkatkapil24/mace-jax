@@ -587,19 +587,19 @@ class RadialMLP(nnx.Module):
         This equals applying the MLP to ``[edge_feats, source[sender],
         target[receiver]]``. Only the first affine map is factored; all
         subsequent normalization and nonlinear operations are unchanged.
-        Other precisions retain the original map because reduced-precision
-        matrix products can round differently after factoring.
+        Homogeneous inputs use their requested dtype and matrix precision.
+        Mixed dtypes retain the original map to preserve dtype promotion.
 
         ``output_scale`` is a scalar or one scalar per edge with shape
-        ``(n_edges, 1)``. In float64 it is folded into the final affine map
+        ``(n_edges, 1)``. It is folded into the final affine map
         to avoid retaining an additional unscaled edge-weight array.
         """
         if output_scale is not None:
             output_scale = jnp.broadcast_to(output_scale, (edge_feats.shape[0], 1))
         first = self.net.layers['0']
-        if any(value.dtype != jnp.float64 for value in (
+        if any(value.dtype != edge_feats.dtype for value in (
             edge_feats, source_embedding, target_embedding, first.kernel,
-        )) or (first.dtype is not None and first.dtype != jnp.float64):
+        )) or (first.dtype is not None and first.dtype != edge_feats.dtype):
             output = self(jnp.concatenate(
                 (edge_feats, source_embedding[edge_index[0]],
                  target_embedding[edge_index[1]]), axis=-1,
@@ -630,8 +630,8 @@ class RadialMLP(nnx.Module):
             output = self.net._apply_layers(projected, start=1)
             return output if output_scale is None else output * output_scale
         last = self.net.layers[self.net._layer_order[-1][1]]
-        if last.kernel.dtype != jnp.float64 or (
-            last.dtype is not None and last.dtype != jnp.float64
+        if last.kernel.dtype != projected.dtype or (
+            last.dtype is not None and last.dtype != projected.dtype
         ):
             return self.net._apply_layers(projected, start=1) * output_scale
         hidden = self.net._apply_layers(projected, start=1, stop=-1)

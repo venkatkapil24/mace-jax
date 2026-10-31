@@ -41,6 +41,13 @@ def compute_forces(
     return forces
 
 
+def _apply_graph_matrix(vectors, matrices, graph_indices):
+    """Apply each graph's matrix without a contended one-graph gather VJP."""
+    if matrices.shape[0] == 1:
+        return jnp.matmul(vectors, matrices[0], precision=lax.Precision.HIGHEST)
+    return jnp.einsum('be,bec->bc', vectors, matrices[graph_indices])
+
+
 def compute_forces_and_stress(
     energy_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
     positions: jnp.ndarray,  # [n_nodes, 3]
@@ -70,17 +77,17 @@ def compute_forces_and_stress(
         )  # shape: [n_graphs, 3, 3]
 
         # Apply symmetric deformation to positions:
-        deformed_positions = positions + jnp.einsum(
-            'be,bec->bc', positions, symmetric_displacement[batch]
+        deformed_positions = positions + _apply_graph_matrix(
+            positions, symmetric_displacement, batch
         )
         cell_reshaped = cell.reshape(-1, 3, 3)  # [n_graphs, 3, 3]
         cell_reshaped = cell_reshaped + jnp.matmul(
             cell_reshaped, symmetric_displacement
         )  # [n_graphs, 3, 3]
-        shifts = jnp.einsum(
-            'be,bec->bc',
+        shifts = _apply_graph_matrix(
             unit_shifts,  # [n_edges, 3]
-            cell_reshaped[batch[edge_index[0]]],  # [n_edges, 3, 3]
+            cell_reshaped,
+            batch[edge_index[0]],
         )  # → [n_edges, 3]
 
         per_graph_energy = energy_fn(deformed_positions, shifts=shifts)
@@ -171,17 +178,17 @@ def get_outputs(
     def energy_displacement_fn(pos, disp):
         """Return total energy and per-graph energies for a symmetric displacement."""
         symmetric_displacement = 0.5 * (disp + jnp.swapaxes(disp, -1, -2))
-        deformed_positions = pos + jnp.einsum(
-            'be,bec->bc', pos, symmetric_displacement[batch]
+        deformed_positions = pos + _apply_graph_matrix(
+            pos, symmetric_displacement, batch
         )
         cell_reshaped = cell.reshape(-1, 3, 3)
         cell_reshaped = cell_reshaped + jnp.matmul(
             cell_reshaped, symmetric_displacement
         )
-        shifts = jnp.einsum(
-            'be,bec->bc',
+        shifts = _apply_graph_matrix(
             unit_shifts,
-            cell_reshaped[batch[edge_index[0]]],
+            cell_reshaped,
+            batch[edge_index[0]],
         )
         per_graph_energy, aux = evaluate(
             deformed_positions, shifts=shifts, cell=cell_reshaped

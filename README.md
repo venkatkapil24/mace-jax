@@ -190,19 +190,29 @@ The model output interface uses one forward evaluation with auxiliary
 outputs passed through `jax.value_and_grad`; selecting only energy and forces
 does not require an additional model evaluation.
 
-For float64 nonlinear interactions, the first radial-network projection is
+For homogeneous float32/float64 nonlinear interactions, the first radial-network projection is
 split into edge and atom contributions. Atom-type contributions are projected
 once per atom and then gathered for its edges, rather than repeating the same
 wide projection for every neighbour. The checkpoint parameters and subsequent
-normalization/nonlinear layers are unchanged. Other precisions retain the
-original concatenated projection to preserve their rounding behavior.
+normalization/nonlinear layers are unchanged. The projection follows the
+requested matrix precision, including TF32 when selected. Mixed input and
+parameter dtypes retain the concatenated projection to preserve dtype promotion.
 
-In the same float64 path, a scalar cutoff per edge is folded into the last
+In the same factored path, a scalar cutoff per edge is folded into the last
 affine projection: `(hidden @ weight + bias) * cutoff` becomes
 `(hidden * cutoff) @ weight + bias * cutoff`. This avoids retaining a second
 wide edge-weight array during differentiation. The checkpoint and mathematical
-function are unchanged, with differences at floating-point roundoff; other
-precisions keep scaling after the projection.
+function are unchanged. Reordering the operations can change rounding at the
+selected precision; focused tests cover float32, float64, and the TF32 policy.
+
+For one graph, stress evaluation applies the shared cell and strain matrices
+with direct matrix products instead of gathering a copy per edge or atom.
+This avoids a highly contended float32 scatter in the backward calculation.
+These geometry products keep full matrix precision under a TF32 neural policy.
+`jax.vmap` can still batch systems with different cells; each mapped system
+uses its own matrix. Packed batches containing several graphs retain the
+general graph-indexed calculation. Summation order can change, so agreement
+is numerical rather than bitwise.
 
 `prepare_jit_data` uses the reference cell to choose a fixed set of integer
 reciprocal indices; the compiled calculation still uses the live cell for

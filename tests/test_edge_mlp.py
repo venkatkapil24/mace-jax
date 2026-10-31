@@ -11,7 +11,8 @@ from mace_jax.modules.radial import RadialMLP
 @pytest.mark.parametrize('scaled', [False, True])
 @pytest.mark.parametrize('dtype', ['float32', 'float64', 'mixed'])
 @pytest.mark.parametrize('hidden', [(), (16,), (16, 8)])
-def test_factored_edge_projection_matches_concatenated_mlp(dtype, hidden, scaled):
+@pytest.mark.parametrize('precision', ['highest', 'tensorfloat32'])
+def test_factored_edge_projection_matches_concatenated_mlp(dtype, hidden, scaled, precision):
     rng = np.random.default_rng(946)
     parameter_dtype = 'float32' if dtype == 'mixed' else dtype
     edge_dtype = 'float64' if dtype == 'mixed' else dtype
@@ -45,9 +46,10 @@ def test_factored_edge_projection_matches_concatenated_mlp(dtype, hidden, scaled
         def objective(*args):
             output = evaluate(*args, factored=factored)
             return jnp.sum(output*probe), output
-        results.append(jax.jit(jax.value_and_grad(
-            objective, argnums=(0, 1, 2, 3, 4), has_aux=True,
-        ))(*args))
+        with jax.default_matmul_precision(precision):
+            results.append(jax.jit(jax.value_and_grad(
+                objective, argnums=(0, 1, 2, 3, 4), has_aux=True,
+            ))(*args))
     expected, actual = map(jax.tree.leaves, results)
     assert len(expected) == len(actual)
     for a, b in zip(actual, expected):
@@ -55,7 +57,36 @@ def test_factored_edge_projection_matches_concatenated_mlp(dtype, hidden, scaled
         # Their accumulation may differ by a float32 rounding step on GPU.
         assert a.dtype == b.dtype
         tolerance = 3e-5 if a.dtype == jnp.float32 else 2e-11
+        if dtype == 'float32' and precision == 'tensorfloat32':
+            # TF32 has a ten-bit product mantissa; changing the projection
+            # order also changes where operands are rounded for each GEMM.
+            tolerance = 1e-2
         np.testing.assert_allclose(a, b, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize('precision', ['highest', 'tensorfloat32'])
+def test_float32_edge_projection_uses_factored_path(monkeypatch, precision):
+    model = RadialMLP([3, 4, 2], rngs=nnx.Rngs(4))
+    graphdef, params = nnx.split(model)
+    params = jax.tree.map(
+        lambda x: x.astype(jnp.float32) if jnp.issubdtype(x.dtype, jnp.floating) else x,
+        params,
+    )
+    model = nnx.merge(graphdef, params)
+
+    def plain_projection_is_disabled(*args, **kwargs):
+        raise AssertionError('Homogeneous float32 must use the factored path')
+
+    monkeypatch.setattr(RadialMLP, '__call__', plain_projection_is_disabled)
+    edge = jnp.ones((3, 1), dtype=jnp.float32)
+    nodes = jnp.ones((2, 1), dtype=jnp.float32)
+    indices = jnp.asarray([[0, 1, 0], [1, 0, 1]])
+    with jax.default_matmul_precision(precision):
+        result = jax.jit(lambda x: model.with_node_embeddings(
+            x, nodes, nodes, indices, output_scale=.3,
+        ))(edge)
+    assert result.dtype == jnp.float32
+    assert np.isfinite(result).all()
 
 
 def test_edge_output_scale_is_scalar_per_edge():
