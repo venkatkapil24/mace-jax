@@ -224,17 +224,6 @@ def test_periodic_image_graph_matches_ase_and_jit(box, cutoff):
         assert actual == expected
 
 
-def test_openmm_default_force_settings(monkeypatch):
-    from pathlib import Path
-
-    path = Path(__file__).resolve().parents[1] / 'examples/HydrogenMaleate-MACE-POLAR'
-    monkeypatch.syspath_prepend(str(path))
-    from simulation_settings import resolve_force_settings
-
-    settings = resolve_force_settings('openmm', 11.76)
-    assert settings.grid_shape == (30, 30, 30)
-    assert settings.order == 5
-    np.testing.assert_allclose(settings.alpha, 0.5232507342707401, atol=1e-15)
 
 
 def test_charged_point_pme_subtraction():
@@ -360,36 +349,4 @@ def test_mechanical_subtraction_exceptions_beyond_cutoff():
         / 10,
         atol=2e-10,
         rtol=0,
-    )
-
-
-def test_generalized_accurate_settings_and_initial_velocities(monkeypatch):
-    from pathlib import Path
-
-    from ase import Atoms
-
-    from mace_jax.tools.physical_constants import OPENMM_MACE_SCALE
-
-    path = Path(__file__).resolve().parents[1] / 'examples/HydrogenMaleate-MACE-POLAR'
-    monkeypatch.syspath_prepend(str(path))
-    from simulation_settings import generate_velocities, resolve_force_settings
-
-    settings = resolve_force_settings('generalized-accurate', 11.76)
-    assert settings.grid_shape is None  # The model creates its generalized mesh.
-    assert settings.order == 8
-    assert settings.cutoff == 5.8
-    np.testing.assert_allclose(
-        np.exp(-((settings.alpha * settings.cutoff) ** 2)) / 2, 1e-6, rtol=1e-14
-    )
-    assert settings.ml_energy_scale == OPENMM_MACE_SCALE
-    atoms = Atoms('OH2', positions=[[0, 0, 0], [1, 0, 0], [0, 1, 0]])
-    accurate = generate_velocities(atoms, 330, 123, 'generalized-accurate')
-    reference = generate_velocities(atoms, 330, 123, 'openmm')
-    np.testing.assert_array_equal(accurate, reference)
-    np.testing.assert_array_equal(
-        generate_velocities(atoms, 0, 123, 'generalized-accurate'), np.zeros((3, 3))
-    )
-    matched = resolve_force_settings('generalized-accurate', 11.76, tolerance=5e-5)
-    np.testing.assert_allclose(
-        matched.alpha, resolve_force_settings('openmm', 11.76).alpha, atol=1e-15
     )

@@ -25,3 +25,9 @@ results
 
 # Nox
 .nox
+
+# OS metadata and local build artifacts
+.DS_Store
+._*
+dist/
+.ruff_cache/

@@ -1,0 +1,35 @@
+name: MACE-POLAR regression tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JAX_PLATFORMS: cpu
+      JAX_ENABLE_X64: 'true'
+      OMP_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e '.[test]' 'jax==0.10.2' 'jaxlib==0.10.2' 'flax==0.12.8' 'mace-torch==0.3.17'
+      - name: Run focused CPU regressions
+        run: >-
+          python -m pytest -q
+          tests/test_polar_blocks.py
+          tests/test_polar_electrostatics.py
+          tests/test_polar_periodic.py
+          tests/test_polar_mm_embedding.py
+          tests/test_polar_graph_data.py
+          tests/test_polar_reduction_regression.py
+          tests/test_graph_precision.py
+          tests/test_output_interface.py
+          tests/test_frozen_apply.py

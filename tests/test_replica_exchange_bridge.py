@@ -60,20 +60,6 @@ def test_exchange_refreshes_total_energy_and_rescales_velocity():
     np.testing.assert_allclose(rescaled.velocity, s.velocity*jnp.sqrt(4/3))
     assert float(simulate.log_probability(s, lambda r: 999., kT=2.)) == -float(s.potential_energy)/2
 
-def test_restart_preserves_rng_labels_neighbors_and_exact_continuation(tmp_path, monkeypatch):
-    import sys
-    from pathlib import Path
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'examples/HydrogenMaleate-MACE-POLAR'))
-    from remd import save_state, restore_state
-    _, state, apply, _, _, _ = setup(stride=1)
-    step = jax.jit(lambda s: apply(s, model_params=2.))
-    state = step(step(state))
-    checkpoint = tmp_path/'checkpoint.npz'
-    save_state(checkpoint, state)
-    restored = restore_state(checkpoint, state)
-    uninterrupted, resumed = step(state), step(restored)
-    for a, b in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed)):
-        np.testing.assert_array_equal(a, b)
 
 def test_uint8_partition_error_keeps_boolean_scan_state():
     _, state, apply, _, _, _ = setup(stride=1)

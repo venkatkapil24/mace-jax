@@ -980,7 +980,6 @@ class StreamingGraphDataLoader:
 
     def split_by_heads(self) -> dict[str, StreamingGraphDataLoader]:
         """Split the loader into per-head StreamingGraphDataLoader instances."""
-        # TODO: Review and test split_by_heads behavior thoroughly (multi-head, stats, ordering).
         if len(self._head_to_index) <= 1:
             return {}
         grouped: dict[str, list[StreamingDatasetSpec]] = {}

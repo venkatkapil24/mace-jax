@@ -1,7 +1,7 @@
 """Connect cached MACE-POLAR forces to JAX-MD's temperature-exchange API.
 
-Requires venkatkapil24/jax-md working-branch. Units match our existing
-MD driver: Angstrom, ps, dalton and eV. Model parameters are shared
+Requires venkatkapil24/jax-md working-branch. Units are Angstrom, ps,
+dalton and eV. Model parameters are shared
 runtime inputs, and each continuous trajectory owns its neighbor lists.
 """
 

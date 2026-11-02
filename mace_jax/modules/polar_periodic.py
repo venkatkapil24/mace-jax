@@ -837,8 +837,7 @@ class PeriodicPolarElectrostatics:
         All Fourier terms omit ``G=0``. If the MM charges are not neutral, the
         restored Ewald energy must therefore include
         :func:`ewald_neutralizing_background_energy` to use the same uniform
-        background convention. This proof of concept handles one periodic
-        graph.
+        background convention. This method handles one periodic graph.
         """
         qm_density, _ = self._density_and_potential(source_feats, cache)
         mm_density = self.point_charge_density(mm_positions, mm_charges, cache)

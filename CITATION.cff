@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "Please cite this software and the MACE/MACE-POLAR papers linked in README.md."
+title: "MACE-JAX: MACE-POLAR JAX implementation and ML/MM support"
+type: software
+license: MIT
+repository-code: "https://github.com/venkatkapil24/mace-jax"
+authors:
+  - family-names: Benner
+    given-names: Philipp
+  - family-names: Gangan
+    given-names: Abhijeet
+  - family-names: Geiger
+    given-names: Mario
+  - family-names: Batatia
+    given-names: Ilyes
+  - family-names: Kapil
+    given-names: Venkat

@@ -136,12 +136,6 @@ def config_from_atoms(
             assert remap_stress.dtype.kind == 'i'
             stress = stress.flatten()[remap_stress]
 
-        # TODO(mario): fix this
-        # make it traceless? because it seems that our formula is not valid for the trace
-        # pressure = np.trace(stress)
-        # stress -= pressure / 3.0 * np.eye(3)
-    # else:
-    # pressure = None
 
     forces = atoms.arrays.get(forces_key, None)  # eV / Ang
     if forces is None:
